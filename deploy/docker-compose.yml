@@ -1,0 +1,51 @@
+# Local development stack: the Go app plus the backing services it will use in
+# later phases (Postgres for snapshots, Redis for cross-instance fan-out).
+#
+# At the scaffold stage the app only serves /healthz; postgres and redis are
+# defined now so the topology is visible and ready for Phases 4 and 5.
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      WB_ADDR: ":8080"
+      # Wired up in later phases:
+      # WB_DATABASE_URL: "postgres://whiteboard:whiteboard@postgres:5432/whiteboard?sslmode=disable"
+      # WB_REDIS_ADDR: "redis:6379"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: whiteboard
+      POSTGRES_PASSWORD: whiteboard
+      POSTGRES_DB: whiteboard
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U whiteboard"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

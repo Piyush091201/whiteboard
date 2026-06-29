@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+web/node_modules
+web/dist
+bin
+out
+*.exe
+*.out
+README.md
+docs

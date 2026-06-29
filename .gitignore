@@ -1,0 +1,28 @@
+# Binaries
+/bin/
+/out/
+*.exe
+*.exe~
+server
+
+# Test / coverage artifacts
+*.out
+coverage.*
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Env / secrets
+.env
+.env.local
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Frontend (Phase 9)
+web/node_modules/
+web/dist/

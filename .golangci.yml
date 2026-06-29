@@ -1,0 +1,15 @@
+# golangci-lint v2 configuration.
+# Kept deliberately small at the scaffold stage; tighten as the codebase grows.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck      # unchecked errors — the #1 Go correctness footgun
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
