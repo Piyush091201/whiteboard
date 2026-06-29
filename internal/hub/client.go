@@ -1,0 +1,151 @@
+package hub
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"log/slog"
+	"sync"
+	"time"
+)
+
+const (
+	// sendBuffer is how many messages may queue for a client before it is
+	// considered too slow and kicked. Sized to absorb normal bursts.
+	sendBuffer = 256
+	// pingInterval / pingTimeout drive heartbeats: a connection that fails to
+	// answer a ping within the timeout is treated as dead and torn down.
+	pingInterval = 30 * time.Second
+	pingTimeout  = 10 * time.Second
+	// writeTimeout bounds a single outbound write so a stuck socket can't pin a
+	// write pump forever.
+	writeTimeout = 10 * time.Second
+)
+
+// Conn is the minimal transport the hub needs from a WebSocket connection.
+// *websocket.Conn is adapted to this in package ws; tests use an in-memory fake.
+//
+// For a C# developer: in Go an interface is satisfied structurally — the
+// implementer never declares "implements Conn". Defining a small interface at
+// the point of use (here, in the consumer) rather than alongside the
+// implementation is idiomatic. Each method takes a context.Context, the
+// analog of threading a CancellationToken through every async call.
+type Conn interface {
+	Read(ctx context.Context) ([]byte, error)
+	Write(ctx context.Context, data []byte) error
+	Ping(ctx context.Context) error
+	Close() error
+}
+
+// Client is one connected participant: a transport plus a buffered outbound
+// queue. The queue is the backpressure boundary — see Board.fanout.
+type Client struct {
+	id      string
+	boardID string
+	board   *Board
+	conn    Conn
+	send    chan []byte
+	log     *slog.Logger
+}
+
+// Serve attaches conn to the board identified by boardID and blocks, pumping
+// messages in both directions until the connection ends. On return it
+// guarantees that both pump goroutines have exited and the client has been
+// released from the hub — there are no leaked goroutines.
+//
+// For a C# developer: this is the structured-concurrency shape you'd build with
+// linked CancellationTokens and Task.WhenAll — here it's a derived context plus
+// a WaitGroup. The defers run in LIFO order on every exit path (including
+// panics), which is how cleanup is guaranteed without try/finally.
+func (h *Hub) Serve(ctx context.Context, boardID string, conn Conn) {
+	c := &Client{
+		id:      newID(),
+		boardID: boardID,
+		conn:    conn,
+		send:    make(chan []byte, sendBuffer),
+	}
+	c.log = h.log.With("client", c.id, "board", boardID)
+
+	// acquire bumps the board's keep-open count under the hub lock, so the
+	// board is guaranteed alive for the register send that follows.
+	c.board = h.acquire(boardID)
+	defer h.release(c)
+
+	c.board.register <- c
+
+	// A connection-scoped context so that when one pump stops, the other
+	// unwinds promptly.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.writePump(ctx)
+	}()
+
+	c.readPump(ctx) // blocks until the connection errors or ctx is cancelled
+
+	cancel()           // signal the write pump to stop
+	_ = c.conn.Close() // unblock anything stuck in a read/write
+	wg.Wait()          // ensure the write pump is gone before we release
+}
+
+// readPump reads inbound messages and hands them to the board for fan-out. It
+// returns on any read error (disconnect, dead heartbeat, cancelled context),
+// which drives the rest of the teardown.
+func (c *Client) readPump(ctx context.Context) {
+	for {
+		data, err := c.conn.Read(ctx)
+		if err != nil {
+			return
+		}
+		select {
+		case c.board.broadcast <- broadcast{origin: c, data: data}:
+		case <-c.board.done: // board is shutting down
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// writePump drains the client's send queue to the socket and emits periodic
+// heartbeats. It returns when the board closes c.send (the client was removed
+// or kicked), when a write or ping fails, or when the context is cancelled.
+func (c *Client) writePump(ctx context.Context) {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case data, ok := <-c.send:
+			if !ok {
+				return // board closed our queue: we've been removed
+			}
+			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+			err := c.conn.Write(wctx, data)
+			cancel()
+			if err != nil {
+				return
+			}
+		case <-ticker.C:
+			pctx, cancel := context.WithTimeout(ctx, pingTimeout)
+			err := c.conn.Ping(pctx)
+			cancel()
+			if err != nil {
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// newID returns a short random hex identifier for a client.
+func newID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
