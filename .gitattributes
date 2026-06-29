@@ -1,0 +1,11 @@
+# Normalize line endings to LF in the repository for cross-platform
+# consistency (development on Windows, CI on Linux). Prevents spurious
+# CRLF/LF diffs.
+* text=auto eol=lf
+
+# Treat these as binary (never normalize).
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
