@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/Piyush091201/whiteboard/internal/protocol"
 )
 
 const (
@@ -92,17 +95,28 @@ func (h *Hub) Serve(ctx context.Context, boardID string, conn Conn) {
 	wg.Wait()          // ensure the write pump is gone before we release
 }
 
-// readPump reads inbound messages and hands them to the board for fan-out. It
-// returns on any read error (disconnect, dead heartbeat, cancelled context),
-// which drives the rest of the teardown.
+// readPump reads inbound messages, parses the envelope, and hands them to the
+// board for sequencing and fan-out. A message that fails to parse is logged and
+// dropped — one malformed frame should not tear down an otherwise healthy
+// connection. readPump returns on any read error (disconnect, dead heartbeat,
+// cancelled context), which drives the rest of the teardown.
+//
+// The cheap, parallelizable JSON parse happens here, in the per-connection
+// goroutine; only sequencing and state mutation are serialized through the
+// board.
 func (c *Client) readPump(ctx context.Context) {
 	for {
 		data, err := c.conn.Read(ctx)
 		if err != nil {
 			return
 		}
+		var env protocol.Envelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			c.log.Warn("dropping unparseable message", "err", err)
+			continue
+		}
 		select {
-		case c.board.broadcast <- broadcast{origin: c, data: data}:
+		case c.board.inbound <- inbound{origin: c, env: env}:
 		case <-c.board.done: // board is shutting down
 			return
 		case <-ctx.Done():

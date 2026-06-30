@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"sync"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"go.uber.org/goleak"
+
+	"github.com/Piyush091201/whiteboard/internal/protocol"
 )
 
 // TestMain runs every test under goleak, which fails the suite if any goroutine
@@ -79,6 +82,38 @@ func (f *fakeConn) Close() error {
 	return nil
 }
 
+// --- helpers ---------------------------------------------------------------
+
+// shapeCreate builds the wire bytes for a shape.create from a client. The
+// inbound seq is zero; the board assigns the authoritative one.
+func shapeCreate(t *testing.T, id, shape string) []byte {
+	t.Helper()
+	data, err := protocol.Marshal(protocol.TypeShapeCreate, 0, protocol.ShapeOp{
+		ID:    id,
+		Shape: json.RawMessage(shape),
+	})
+	if err != nil {
+		t.Fatalf("build shape.create: %v", err)
+	}
+	return data
+}
+
+// readEnvelope reads and decodes one outbound envelope, failing on timeout.
+func readEnvelope(t *testing.T, ch <-chan []byte, timeout time.Duration) protocol.Envelope {
+	t.Helper()
+	select {
+	case raw := <-ch:
+		var env protocol.Envelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			t.Fatalf("decode outbound: %v", err)
+		}
+		return env
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for an outbound message")
+		return protocol.Envelope{}
+	}
+}
+
 // waitForClients blocks until the board reports exactly n clients, or fails.
 func waitForClients(t *testing.T, h *Hub, board string, n int) {
 	t.Helper()
@@ -117,9 +152,12 @@ func waitForBoardGone(t *testing.T, h *Hub, board string) {
 	}
 }
 
-// TestFanout verifies that a message from one client reaches the others and is
-// NOT echoed back to its sender.
-func TestFanout(t *testing.T) {
+// --- tests -----------------------------------------------------------------
+
+// TestFanoutSequencesAndDelivers verifies that a shape op from one client is
+// assigned an authoritative sequence number and delivered to every client,
+// including the origin.
+func TestFanoutSequencesAndDelivers(t *testing.T) {
 	h := New(testLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -129,26 +167,71 @@ func TestFanout(t *testing.T) {
 	go h.Serve(ctx, "board1", b)
 	waitForClients(t, h, "board1", 2)
 
-	a.readCh <- []byte("hello")
-
-	select {
-	case got := <-b.writeCh:
-		if string(got) != "hello" {
-			t.Fatalf("b received %q, want %q", got, "hello")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("b did not receive the broadcast")
+	// Each client first receives its (empty) snapshot on join.
+	if env := readEnvelope(t, a.writeCh, time.Second); env.Type != protocol.TypeSnapshot {
+		t.Fatalf("a first message = %q, want snapshot", env.Type)
+	}
+	if env := readEnvelope(t, b.writeCh, time.Second); env.Type != protocol.TypeSnapshot {
+		t.Fatalf("b first message = %q, want snapshot", env.Type)
 	}
 
-	// The origin must not receive its own message.
-	select {
-	case got := <-a.writeCh:
-		t.Fatalf("origin received its own message: %q", got)
-	case <-time.After(50 * time.Millisecond):
+	a.readCh <- shapeCreate(t, "s1", `{"kind":"rect"}`)
+
+	// b receives the sequenced op.
+	env := readEnvelope(t, b.writeCh, time.Second)
+	if env.Type != protocol.TypeShapeCreate || env.Seq != 1 {
+		t.Fatalf("b got type=%q seq=%d, want shape.create seq=1", env.Type, env.Seq)
+	}
+	var op protocol.ShapeOp
+	if err := env.DecodePayload(&op); err != nil || op.ID != "s1" {
+		t.Fatalf("b op = %+v err=%v, want id s1", op, err)
+	}
+
+	// The origin also receives the authoritative, sequenced op.
+	if envA := readEnvelope(t, a.writeCh, time.Second); envA.Type != protocol.TypeShapeCreate || envA.Seq != 1 {
+		t.Fatalf("origin got type=%q seq=%d, want shape.create seq=1", envA.Type, envA.Seq)
 	}
 
 	cancel()
 	waitForBoardGone(t, h, "board1")
+}
+
+// TestSnapshotOnJoin verifies that a client joining a board with existing state
+// receives that state as a snapshot.
+func TestSnapshotOnJoin(t *testing.T) {
+	h := New(testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+
+	a := newFakeConn(8)
+	go h.Serve(ctx, "room", a)
+	waitForClients(t, h, "room", 1)
+	readEnvelope(t, a.writeCh, time.Second) // drain a's empty snapshot
+
+	a.readCh <- shapeCreate(t, "s1", `{"kind":"rect"}`)
+	readEnvelope(t, a.writeCh, time.Second) // drain a's echo of its own op
+
+	// A second client joins and should be handed the current state.
+	b := newFakeConn(8)
+	go h.Serve(ctx, "room", b)
+	waitForClients(t, h, "room", 2)
+
+	env := readEnvelope(t, b.writeCh, time.Second)
+	if env.Type != protocol.TypeSnapshot {
+		t.Fatalf("b first message = %q, want snapshot", env.Type)
+	}
+	var snap protocol.Snapshot
+	if err := env.DecodePayload(&snap); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if snap.Seq != 1 {
+		t.Errorf("snapshot seq = %d, want 1", snap.Seq)
+	}
+	if len(snap.Shapes) != 1 || snap.Shapes[0].ID != "s1" {
+		t.Fatalf("snapshot shapes = %+v, want one shape s1", snap.Shapes)
+	}
+
+	cancel()
+	waitForBoardGone(t, h, "room")
 }
 
 // TestLifecycleCleanup verifies that clients register, then that the board is
@@ -166,7 +249,6 @@ func TestLifecycleCleanup(t *testing.T) {
 	}
 	waitForClients(t, h, "room", n)
 
-	// Disconnect every client by closing its connection (read pump returns EOF).
 	for _, c := range conns {
 		_ = c.Close()
 	}
@@ -182,17 +264,28 @@ func TestBackpressureKicksSlowClient(t *testing.T) {
 	h := New(testLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 
-	sender := newFakeConn(8) // origin; never receives, so never blocks
-	slow := newFakeConn(0)   // unbuffered writes, nobody reads -> always blocked
-	go h.Serve(ctx, "b", sender)
+	fast := newFakeConn(8) // its outbound is drained below, so it never backs up
+	slow := newFakeConn(0) // unbuffered writes, never drained -> always blocked
+	go h.Serve(ctx, "b", fast)
 	go h.Serve(ctx, "b", slow)
 	waitForClients(t, h, "b", 2)
 
-	// Flood enough messages to overflow the slow client's send buffer.
+	// Continuously drain the fast client's outbound (it receives every echo).
+	go func() {
+		for {
+			select {
+			case <-fast.writeCh:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	op := shapeCreate(t, "s1", `{"kind":"rect"}`)
 	go func() {
 		for i := 0; i < sendBuffer*4; i++ {
 			select {
-			case sender.readCh <- []byte("x"):
+			case fast.readCh <- op:
 			case <-ctx.Done():
 				return
 			}
@@ -201,12 +294,11 @@ func TestBackpressureKicksSlowClient(t *testing.T) {
 
 	select {
 	case <-slow.closed:
-		// kicked: its connection was closed by the board
+		// kicked: the board closed its connection
 	case <-time.After(2 * time.Second):
 		t.Fatal("slow client was not kicked")
 	}
 
-	// The healthy sender stays; the board converges to a single client.
 	waitForClients(t, h, "b", 1)
 
 	cancel()
