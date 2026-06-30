@@ -41,9 +41,16 @@ func Handler(h *hub.Hub) http.Handler {
 		}
 		c.SetReadLimit(maxMessageBytes)
 
+		// Optional identity supplied as query params, e.g.
+		// /ws/board1?name=Ada&color=%23ff0000. Missing fields get defaults.
+		info := hub.ClientInfo{
+			Name:  r.URL.Query().Get("name"),
+			Color: r.URL.Query().Get("color"),
+		}
+
 		// Serve blocks until the connection ends. Use the request context so the
 		// connection is cancelled if the server tears the request down.
-		h.Serve(r.Context(), boardID, &conn{ws: c})
+		h.Serve(r.Context(), boardID, info, &conn{ws: c})
 
 		// Best-effort close; the connection is usually already gone.
 		_ = c.CloseNow()

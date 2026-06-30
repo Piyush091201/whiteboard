@@ -62,11 +62,9 @@ func (b *Board) run() {
 	for {
 		select {
 		case c := <-b.register:
-			b.clients[c] = struct{}{}
-			b.sendSnapshot(c)
-			b.log.Debug("client registered", "client", c.id, "clients", len(b.clients))
+			b.join(c)
 		case c := <-b.unregister:
-			b.remove(c)
+			b.detach(c, false)
 		case in := <-b.inbound:
 			b.handle(in)
 		case ch := <-b.inspect:
@@ -78,11 +76,25 @@ func (b *Board) run() {
 	}
 }
 
-// handle processes one inbound message. Shape operations are applied to the
-// document under last-write-wins — the board assigns the authoritative sequence
-// number — and the sequenced result is fanned out to every client (including
-// the origin, so its optimistic local edit is reconciled with the server's
-// ordering).
+// join admits a client: it tells existing participants the newcomer arrived,
+// adds it to the set, and greets it with the current document snapshot and the
+// presence roster.
+func (b *Board) join(c *Client) {
+	b.announceJoin(c) // c is not in the set yet, so it won't receive its own join
+	b.clients[c] = struct{}{}
+	c.present = true
+	b.greet(c)
+	b.log.Debug("client joined", "client", c.id, "clients", len(b.clients))
+}
+
+// handle processes one inbound message.
+//
+//   - Shape ops are applied to the document under last-write-wins (the board
+//     assigns the authoritative sequence number) and reliably fanned out to
+//     every client, including the origin.
+//   - Cursor moves are stamped with the origin's id and relayed best-effort to
+//     the other clients: ephemeral, so dropped rather than buffered under
+//     backpressure.
 func (b *Board) handle(in inbound) {
 	switch in.env.Type {
 	case protocol.TypeShapeCreate, protocol.TypeShapeUpdate, protocol.TypeShapeDelete:
@@ -97,37 +109,83 @@ func (b *Board) handle(in inbound) {
 			b.log.Error("failed to encode outbound op", "err", err)
 			return
 		}
-		b.deliver(out, nil) // authoritative op goes to everyone
+		b.deliverReliable(out, nil)
+
+	case protocol.TypeCursor:
+		var cur protocol.Cursor
+		if err := in.env.DecodePayload(&cur); err != nil {
+			b.log.Warn("dropping invalid cursor", "err", err)
+			return
+		}
+		cur.ClientID = in.origin.id // stamp authoritative id; clients can't spoof
+		out, err := protocol.Marshal(protocol.TypeCursor, 0, cur)
+		if err != nil {
+			return
+		}
+		b.deliverBestEffort(out, in.origin)
+
 	default:
 		b.log.Warn("ignoring unknown message type", "type", in.env.Type)
 	}
 }
 
-// sendSnapshot pushes the current board state to a newly joined client so it
-// renders in sync immediately.
-func (b *Board) sendSnapshot(c *Client) {
-	data, err := protocol.Marshal(protocol.TypeSnapshot, 0, b.doc.snapshot())
+// greet sends a newly joined client the current document snapshot followed by
+// the presence roster (itself plus everyone else already here).
+func (b *Board) greet(c *Client) {
+	snap, err := protocol.Marshal(protocol.TypeSnapshot, 0, b.doc.snapshot())
 	if err != nil {
 		b.log.Error("failed to encode snapshot", "err", err)
+	} else if !b.push(c, snap) {
+		return // c was kicked while onboarding; do not touch its closed channel
+	}
+
+	others := make([]protocol.Presence, 0, len(b.clients))
+	for o := range b.clients {
+		if o == c {
+			continue
+		}
+		others = append(others, o.presence())
+	}
+	state, err := protocol.Marshal(protocol.TypePresenceState, 0, protocol.PresenceState{
+		Self:   c.presence(),
+		Others: others,
+	})
+	if err != nil {
+		b.log.Error("failed to encode presence state", "err", err)
 		return
 	}
-	select {
-	case c.send <- data:
-	default:
-		// A just-registered client has an empty buffer, so this should not
-		// happen; kick defensively rather than block the board.
-		b.kick(c)
-	}
+	b.push(c, state)
 }
 
-// deliver sends data to every client except exclude (nil means all). The send
-// is non-blocking: a client whose buffered channel is full is "kicked" rather
-// than allowed to stall the whole board. This is the backpressure guarantee —
-// one slow consumer can never block fan-out for everyone else.
+func (b *Board) announceJoin(c *Client) {
+	data, err := protocol.Marshal(protocol.TypePresenceJoin, 0, c.presence())
+	if err != nil {
+		b.log.Error("failed to encode presence join", "err", err)
+		return
+	}
+	b.deliverReliable(data, nil)
+}
+
+func (b *Board) announceLeave(c *Client) {
+	data, err := protocol.Marshal(protocol.TypePresenceLeave, 0, protocol.Presence{ClientID: c.id})
+	if err != nil {
+		b.log.Error("failed to encode presence leave", "err", err)
+		return
+	}
+	b.deliverReliable(data, nil)
+}
+
+// deliverReliable sends data to every client except exclude (nil means all),
+// guaranteeing delivery for clients that keep up. A client whose buffered
+// channel is full is collected and kicked AFTER the loop completes — never
+// during iteration — so the follow-on presence.leave fan-out cannot recurse
+// into a map we are still ranging.
 //
-// For a C# developer: the select-with-default is exactly
-// Channel<T>.Writer.TryWrite — a non-blocking offer.
-func (b *Board) deliver(data []byte, exclude *Client) {
+// For a C# developer: the select-with-default is Channel<T>.Writer.TryWrite — a
+// non-blocking offer. Reliable messages (shape ops, presence) disconnect a
+// client that cannot keep up so it reconnects and resyncs.
+func (b *Board) deliverReliable(data []byte, exclude *Client) {
+	var slow []*Client
 	for c := range b.clients {
 		if c == exclude {
 			continue
@@ -135,39 +193,71 @@ func (b *Board) deliver(data []byte, exclude *Client) {
 		select {
 		case c.send <- data:
 		default:
-			b.log.Warn("kicking slow client: send buffer full", "client", c.id)
-			b.kick(c)
+			slow = append(slow, c)
+		}
+	}
+	for _, c := range slow {
+		b.log.Warn("kicking slow client: send buffer full", "client", c.id)
+		b.detach(c, true)
+	}
+}
+
+// deliverBestEffort sends data to every client except exclude, dropping the
+// message for any client whose buffer is full. Used for cursor updates: a
+// stale cursor position is worthless, so it is never worth buffering or kicking
+// a client over.
+func (b *Board) deliverBestEffort(data []byte, exclude *Client) {
+	for c := range b.clients {
+		if c == exclude {
+			continue
+		}
+		select {
+		case c.send <- data:
+		default:
+			// drop: the next cursor update supersedes this one
 		}
 	}
 }
 
-// remove drops a client from the fan-out set and closes its send channel.
-// Idempotent: a client that was already removed (e.g. previously kicked for
-// being slow) is a no-op. Because every close of c.send happens here, in the
-// single run() goroutine, and is guarded by map membership, a send channel is
-// never closed twice.
-func (b *Board) remove(c *Client) {
-	if _, ok := b.clients[c]; !ok {
+// push delivers one reliable message to a single client, kicking it if its
+// buffer is full. Returns false if the client was kicked.
+func (b *Board) push(c *Client, data []byte) bool {
+	select {
+	case c.send <- data:
+		return true
+	default:
+		b.log.Warn("kicking slow client during onboarding", "client", c.id)
+		b.detach(c, true)
+		return false
+	}
+}
+
+// detach removes a client from the board: it stops fan-out to the client,
+// closes its send channel, optionally closes its connection (to unblock the
+// read pump when the board initiated the removal), and announces its departure
+// to the remaining clients. The present flag makes this idempotent, so a client
+// that is kicked and then unregistered is announced exactly once.
+//
+// Because every close of c.send happens here, in the single run() goroutine,
+// and is guarded by the present flag, a send channel is never closed twice.
+func (b *Board) detach(c *Client, closeConn bool) {
+	if !c.present {
 		return
 	}
+	c.present = false
 	delete(b.clients, c)
 	close(c.send)
+	if closeConn {
+		_ = c.conn.Close() // unblocks the client's read pump
+	}
+	b.announceLeave(c)
 }
 
-// kick forcibly disconnects a client that cannot keep up. Closing its send
-// channel stops the write pump; closing the connection unblocks the read pump.
-// The client then reconnects and resyncs from the snapshot it receives on join.
-//
-// Deleting the current key during a range over the same map is safe in Go.
-func (b *Board) kick(c *Client) {
-	delete(b.clients, c)
-	close(c.send)
-	_ = c.conn.Close()
-}
-
-// shutdown drains every remaining client when the board stops.
+// shutdown drains every remaining client when the board stops. No leave
+// notifications are sent: the board itself is going away.
 func (b *Board) shutdown() {
 	for c := range b.clients {
+		c.present = false
 		delete(b.clients, c)
 		close(c.send)
 		_ = c.conn.Close()

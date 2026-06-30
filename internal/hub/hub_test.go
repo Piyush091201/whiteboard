@@ -84,8 +84,6 @@ func (f *fakeConn) Close() error {
 
 // --- helpers ---------------------------------------------------------------
 
-// shapeCreate builds the wire bytes for a shape.create from a client. The
-// inbound seq is zero; the board assigns the authoritative one.
 func shapeCreate(t *testing.T, id, shape string) []byte {
 	t.Helper()
 	data, err := protocol.Marshal(protocol.TypeShapeCreate, 0, protocol.ShapeOp{
@@ -98,23 +96,67 @@ func shapeCreate(t *testing.T, id, shape string) []byte {
 	return data
 }
 
-// readEnvelope reads and decodes one outbound envelope, failing on timeout.
-func readEnvelope(t *testing.T, ch <-chan []byte, timeout time.Duration) protocol.Envelope {
+func cursorMsg(t *testing.T, x, y float64) []byte {
 	t.Helper()
-	select {
-	case raw := <-ch:
-		var env protocol.Envelope
-		if err := json.Unmarshal(raw, &env); err != nil {
-			t.Fatalf("decode outbound: %v", err)
-		}
-		return env
-	case <-time.After(timeout):
-		t.Fatal("timed out waiting for an outbound message")
-		return protocol.Envelope{}
+	data, err := protocol.Marshal(protocol.TypeCursor, 0, protocol.Cursor{X: x, Y: y})
+	if err != nil {
+		t.Fatalf("build cursor: %v", err)
+	}
+	return data
+}
+
+// decodePayload decodes an envelope payload into v, failing the test on error.
+func decodePayload(t *testing.T, env protocol.Envelope, v any) {
+	t.Helper()
+	if err := env.DecodePayload(v); err != nil {
+		t.Fatalf("decode payload: %v", err)
 	}
 }
 
-// waitForClients blocks until the board reports exactly n clients, or fails.
+// readUntilType reads and decodes outbound messages, skipping types other than
+// want (e.g. the snapshot and presence frames a client receives on join), and
+// returns the first envelope of type want. Fails on timeout.
+func readUntilType(t *testing.T, ch <-chan []byte, want protocol.Type, timeout time.Duration) protocol.Envelope {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case raw := <-ch:
+			var env protocol.Envelope
+			if err := json.Unmarshal(raw, &env); err != nil {
+				t.Fatalf("decode outbound: %v", err)
+			}
+			if env.Type == want {
+				return env
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for message type %q", want)
+			return protocol.Envelope{}
+		}
+	}
+}
+
+// expectNoMessageOfType reads for dur and fails if a message of type notWant
+// arrives. Messages of other types are ignored.
+func expectNoMessageOfType(t *testing.T, ch <-chan []byte, notWant protocol.Type, dur time.Duration) {
+	t.Helper()
+	deadline := time.After(dur)
+	for {
+		select {
+		case raw := <-ch:
+			var env protocol.Envelope
+			if err := json.Unmarshal(raw, &env); err != nil {
+				t.Fatalf("decode outbound: %v", err)
+			}
+			if env.Type == notWant {
+				t.Fatalf("unexpectedly received a message of type %q", notWant)
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
 func waitForClients(t *testing.T, h *Hub, board string, n int) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
@@ -133,7 +175,6 @@ func waitForClients(t *testing.T, h *Hub, board string, n int) {
 	}
 }
 
-// waitForBoardGone blocks until the board has been removed from the registry.
 func waitForBoardGone(t *testing.T, h *Hub, board string) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
@@ -163,24 +204,16 @@ func TestFanoutSequencesAndDelivers(t *testing.T) {
 
 	a := newFakeConn(8)
 	b := newFakeConn(8)
-	go h.Serve(ctx, "board1", a)
-	go h.Serve(ctx, "board1", b)
+	go h.Serve(ctx, "board1", ClientInfo{Name: "A"}, a)
+	go h.Serve(ctx, "board1", ClientInfo{Name: "B"}, b)
 	waitForClients(t, h, "board1", 2)
-
-	// Each client first receives its (empty) snapshot on join.
-	if env := readEnvelope(t, a.writeCh, time.Second); env.Type != protocol.TypeSnapshot {
-		t.Fatalf("a first message = %q, want snapshot", env.Type)
-	}
-	if env := readEnvelope(t, b.writeCh, time.Second); env.Type != protocol.TypeSnapshot {
-		t.Fatalf("b first message = %q, want snapshot", env.Type)
-	}
 
 	a.readCh <- shapeCreate(t, "s1", `{"kind":"rect"}`)
 
 	// b receives the sequenced op.
-	env := readEnvelope(t, b.writeCh, time.Second)
-	if env.Type != protocol.TypeShapeCreate || env.Seq != 1 {
-		t.Fatalf("b got type=%q seq=%d, want shape.create seq=1", env.Type, env.Seq)
+	env := readUntilType(t, b.writeCh, protocol.TypeShapeCreate, time.Second)
+	if env.Seq != 1 {
+		t.Fatalf("b got seq=%d, want 1", env.Seq)
 	}
 	var op protocol.ShapeOp
 	if err := env.DecodePayload(&op); err != nil || op.ID != "s1" {
@@ -188,8 +221,8 @@ func TestFanoutSequencesAndDelivers(t *testing.T) {
 	}
 
 	// The origin also receives the authoritative, sequenced op.
-	if envA := readEnvelope(t, a.writeCh, time.Second); envA.Type != protocol.TypeShapeCreate || envA.Seq != 1 {
-		t.Fatalf("origin got type=%q seq=%d, want shape.create seq=1", envA.Type, envA.Seq)
+	if envA := readUntilType(t, a.writeCh, protocol.TypeShapeCreate, time.Second); envA.Seq != 1 {
+		t.Fatalf("origin got seq=%d, want 1", envA.Seq)
 	}
 
 	cancel()
@@ -203,22 +236,17 @@ func TestSnapshotOnJoin(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a := newFakeConn(8)
-	go h.Serve(ctx, "room", a)
+	go h.Serve(ctx, "room", ClientInfo{}, a)
 	waitForClients(t, h, "room", 1)
-	readEnvelope(t, a.writeCh, time.Second) // drain a's empty snapshot
 
 	a.readCh <- shapeCreate(t, "s1", `{"kind":"rect"}`)
-	readEnvelope(t, a.writeCh, time.Second) // drain a's echo of its own op
+	readUntilType(t, a.writeCh, protocol.TypeShapeCreate, time.Second) // a's echo
 
-	// A second client joins and should be handed the current state.
 	b := newFakeConn(8)
-	go h.Serve(ctx, "room", b)
+	go h.Serve(ctx, "room", ClientInfo{}, b)
 	waitForClients(t, h, "room", 2)
 
-	env := readEnvelope(t, b.writeCh, time.Second)
-	if env.Type != protocol.TypeSnapshot {
-		t.Fatalf("b first message = %q, want snapshot", env.Type)
-	}
+	env := readUntilType(t, b.writeCh, protocol.TypeSnapshot, time.Second)
 	var snap protocol.Snapshot
 	if err := env.DecodePayload(&snap); err != nil {
 		t.Fatalf("decode snapshot: %v", err)
@@ -245,7 +273,7 @@ func TestLifecycleCleanup(t *testing.T) {
 	conns := make([]*fakeConn, n)
 	for i := range conns {
 		conns[i] = newFakeConn(8)
-		go h.Serve(ctx, "room", conns[i])
+		go h.Serve(ctx, "room", ClientInfo{}, conns[i])
 	}
 	waitForClients(t, h, "room", n)
 
@@ -258,19 +286,18 @@ func TestLifecycleCleanup(t *testing.T) {
 }
 
 // TestBackpressureKicksSlowClient verifies that one slow consumer cannot stall
-// the board: it is kicked once its buffer overflows, while a healthy client on
-// the same board keeps working.
+// the board on reliable traffic: it is kicked once its buffer overflows, while
+// a healthy client on the same board keeps working.
 func TestBackpressureKicksSlowClient(t *testing.T) {
 	h := New(testLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 
 	fast := newFakeConn(8) // its outbound is drained below, so it never backs up
 	slow := newFakeConn(0) // unbuffered writes, never drained -> always blocked
-	go h.Serve(ctx, "b", fast)
-	go h.Serve(ctx, "b", slow)
+	go h.Serve(ctx, "b", ClientInfo{}, fast)
+	go h.Serve(ctx, "b", ClientInfo{}, slow)
 	waitForClients(t, h, "b", 2)
 
-	// Continuously drain the fast client's outbound (it receives every echo).
 	go func() {
 		for {
 			select {
