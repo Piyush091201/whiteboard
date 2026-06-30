@@ -3,7 +3,8 @@
 /out/
 *.exe
 *.exe~
-server
+# A binary built at the repo root (anchored so it does NOT match cmd/server/).
+/server
 
 # Test / coverage artifacts
 *.out
