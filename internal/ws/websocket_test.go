@@ -13,6 +13,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/Piyush091201/whiteboard/internal/broker"
 	"github.com/Piyush091201/whiteboard/internal/hub"
 	"github.com/Piyush091201/whiteboard/internal/protocol"
 )
@@ -22,7 +23,7 @@ import (
 // operation from one is sequenced by the hub and fanned out to the other.
 func TestWebSocketEndToEnd(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := hub.New(logger)
+	h := hub.New(logger, broker.NewMemory())
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /ws/{board}", Handler(h))

@@ -10,9 +10,10 @@ services:
       dockerfile: Dockerfile
     environment:
       WB_ADDR: ":8080"
-      # Wired up in later phases:
+      # Redis backs cross-instance fan-out and shared board state (ADR 0002).
+      WB_REDIS_ADDR: "redis:6379"
+      # Wired up in a later phase:
       # WB_DATABASE_URL: "postgres://whiteboard:whiteboard@postgres:5432/whiteboard?sslmode=disable"
-      # WB_REDIS_ADDR: "redis:6379"
     ports:
       - "8080:8080"
     depends_on:
