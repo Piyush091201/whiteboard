@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -40,15 +41,56 @@ type Conn interface {
 	Close() error
 }
 
-// Client is one connected participant: a transport plus a buffered outbound
-// queue. The queue is the backpressure boundary — see Board.fanout.
+// ClientInfo is the optional identity a client supplies when joining a board
+// (e.g. via WebSocket query parameters). Missing fields are filled with
+// defaults.
+type ClientInfo struct {
+	Name  string
+	Color string
+}
+
+// Client is one connected participant: a transport, an identity, and a buffered
+// outbound queue. The queue is the backpressure boundary — see Board.deliver*.
 type Client struct {
 	id      string
 	boardID string
+	name    string
+	color   string
 	board   *Board
 	conn    Conn
 	send    chan []byte
 	log     *slog.Logger
+
+	// present is owned by the board goroutine. It guards against announcing a
+	// client's departure more than once (e.g. kicked, then unregistered).
+	present bool
+}
+
+// presence describes the client for presence messages.
+func (c *Client) presence() protocol.Presence {
+	return protocol.Presence{ClientID: c.id, Name: c.name, Color: c.color}
+}
+
+// palette provides distinct, stable default cursor colors keyed by client id.
+var palette = []string{
+	"#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+	"#42d4f4", "#f032e6", "#bfef45", "#fabed4", "#469990",
+}
+
+func defaultName(name string) string {
+	if name == "" {
+		return "Anonymous"
+	}
+	return name
+}
+
+func defaultColor(color, id string) string {
+	if color != "" {
+		return color
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(id))
+	return palette[h.Sum32()%uint32(len(palette))]
 }
 
 // Serve attaches conn to the board identified by boardID and blocks, pumping
@@ -60,10 +102,13 @@ type Client struct {
 // linked CancellationTokens and Task.WhenAll — here it's a derived context plus
 // a WaitGroup. The defers run in LIFO order on every exit path (including
 // panics), which is how cleanup is guaranteed without try/finally.
-func (h *Hub) Serve(ctx context.Context, boardID string, conn Conn) {
+func (h *Hub) Serve(ctx context.Context, boardID string, info ClientInfo, conn Conn) {
+	id := newID()
 	c := &Client{
-		id:      newID(),
+		id:      id,
 		boardID: boardID,
+		name:    defaultName(info.Name),
+		color:   defaultColor(info.Color, id),
 		conn:    conn,
 		send:    make(chan []byte, sendBuffer),
 	}

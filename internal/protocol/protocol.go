@@ -19,6 +19,16 @@ const (
 	TypeShapeUpdate Type = "shape.update"
 	TypeShapeDelete Type = "shape.delete"
 
+	// Live cursor position. Client -> server (no id); server stamps the origin
+	// id and relays to the other clients. Ephemeral: dropped under backpressure.
+	TypeCursor Type = "cursor"
+
+	// Presence. Server -> clients as participants come and go, plus a one-time
+	// presence.state to a joiner describing who is already present.
+	TypePresenceJoin  Type = "presence.join"
+	TypePresenceLeave Type = "presence.leave"
+	TypePresenceState Type = "presence.state"
+
 	// Server -> a single client on join.
 	TypeSnapshot Type = "snapshot"
 
@@ -71,6 +81,29 @@ type SnapshotShape struct {
 	Seq   uint64          `json:"seq"`
 	ID    string          `json:"id"`
 	Shape json.RawMessage `json:"shape"`
+}
+
+// Cursor is a live cursor position. ClientID is empty on the inbound message
+// from a client and is stamped by the server before relaying, so a client can
+// never spoof another's id.
+type Cursor struct {
+	ClientID string  `json:"clientId"`
+	X        float64 `json:"x"`
+	Y        float64 `json:"y"`
+}
+
+// Presence identifies a participant on a board.
+type Presence struct {
+	ClientID string `json:"clientId"`
+	Name     string `json:"name,omitempty"`
+	Color    string `json:"color,omitempty"`
+}
+
+// PresenceState is sent to a client when it joins: its own identity plus the
+// participants already on the board.
+type PresenceState struct {
+	Self   Presence   `json:"self"`
+	Others []Presence `json:"others"`
 }
 
 // Marshal builds an envelope of type t carrying payload (already-sequenced with
