@@ -45,6 +45,8 @@ jobs:
           go-version: "1.26"
           cache: true
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v8 installs golangci-lint v2 (matching the version: "2" config) built
+        # with a recent Go, so it can lint a go 1.26 module. v6 shipped v1.
+        uses: golangci/golangci-lint-action@v8
         with:
           version: latest
