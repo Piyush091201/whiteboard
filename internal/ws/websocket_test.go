@@ -38,13 +38,13 @@ func TestWebSocketEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial a: %v", err)
 	}
-	defer a.Close(websocket.StatusNormalClosure, "")
+	defer func() { _ = a.Close(websocket.StatusNormalClosure, "") }()
 
 	b, _, err := websocket.Dial(ctx, wsURL+"/ws/board1", nil)
 	if err != nil {
 		t.Fatalf("dial b: %v", err)
 	}
-	defer b.Close(websocket.StatusNormalClosure, "")
+	defer func() { _ = b.Close(websocket.StatusNormalClosure, "") }()
 
 	op, err := protocol.Marshal(protocol.TypeShapeCreate, 0, protocol.ShapeOp{
 		ID:    "s1",
