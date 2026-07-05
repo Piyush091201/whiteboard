@@ -2,36 +2,28 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 
 	"github.com/Piyush091201/whiteboard/internal/broker"
 	"github.com/Piyush091201/whiteboard/internal/protocol"
 )
 
-// inbound is a client message the board handles locally (rather than through the
-// broker) — in this phase, cursor moves. Shape ops go straight to the broker
-// from the read pump.
-type inbound struct {
-	origin *Client
-	env    protocol.Envelope
-}
-
-// snapshotReq carries a snapshot the connection goroutine fetched from the
-// broker, for the board to deliver. Routing it through the board keeps the board
-// goroutine the sole writer of a client's send channel.
-type snapshotReq struct {
+// clientMsg carries a message the connection goroutine wants delivered to one
+// specific client (its snapshot, its presence roster). Routing it through the
+// board keeps the board goroutine the sole writer of a client's send channel.
+type clientMsg struct {
 	c    *Client
 	data []byte
 }
 
-// Board is the per-board actor. All access to its client set happens inside the
-// single run() goroutine via the channels below, so the set needs no mutex.
-// Authoritative shape state now lives in the broker (shared across instances),
-// not in the board.
+// Board is the per-board actor. It owns only the set of locally-connected
+// clients; authoritative state (shapes, sequence, presence roster) lives in the
+// broker, shared across instances. The board's job is to relay the broker's
+// per-board stream to its local clients.
 //
-// For a C# developer: this is still the actor model, but the aggregate it owned
-// (the document) has moved to the broker so multiple instances can share it —
-// the board now owns only its local connections and relays the broker's stream.
+// For a C# developer: still the actor model, but the board is now a thin
+// per-instance projection of shared state rather than the owner of it.
 type Board struct {
 	id     string
 	log    *slog.Logger
@@ -39,13 +31,13 @@ type Board struct {
 
 	register   chan *Client
 	unregister chan *Client
-	inbound    chan inbound     // local messages (cursors)
-	snapshots  chan snapshotReq // snapshots fetched off-goroutine, to deliver
-	inspect    chan chan int    // request the current client count
-	quit       chan struct{}    // closed by the hub when the board should stop
-	done       chan struct{}    // closed when run() has returned
+	direct     chan clientMsg // deliver a message to one specific client
+	inspect    chan chan int  // request the current client count
+	quit       chan struct{}  // closed by the hub when the board should stop
+	done       chan struct{}  // closed when run() has returned
 
 	clients map[*Client]struct{}
+	byID    map[string]*Client // id -> client, for excluding a cursor's origin
 }
 
 func newBoard(id string, log *slog.Logger, b broker.Broker) *Board {
@@ -55,30 +47,29 @@ func newBoard(id string, log *slog.Logger, b broker.Broker) *Board {
 		broker:     b,
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
-		inbound:    make(chan inbound),
-		snapshots:  make(chan snapshotReq),
+		direct:     make(chan clientMsg),
 		inspect:    make(chan chan int),
 		quit:       make(chan struct{}),
 		done:       make(chan struct{}),
 		clients:    make(map[*Client]struct{}),
+		byID:       make(map[string]*Client),
 	}
 }
 
 // run is the board's event loop. It subscribes to the broker's per-board channel
-// and delivers every published message to the local clients — the single
-// delivery path, so an op from any instance (including this one, on loop-back)
-// reaches everyone exactly the same way. It exits when the hub closes b.quit.
+// and dispatches every published message to the local clients — the single
+// delivery path, so a message from any instance (including this one, on
+// loop-back) reaches everyone the same way. It exits when the hub closes b.quit.
 func (b *Board) run() {
 	defer close(b.done)
 
-	// Subscription lifetime is tied to the board goroutine's lifetime.
 	subCtx, cancelSub := context.WithCancel(context.Background())
 	defer cancelSub()
 
 	msgs, err := b.broker.Subscribe(subCtx, b.id)
 	if err != nil {
 		b.log.Error("broker subscribe failed; board runs without fan-out", "err", err)
-		msgs = nil // selecting a nil channel blocks forever, which is fine
+		msgs = nil
 	}
 
 	for {
@@ -87,17 +78,15 @@ func (b *Board) run() {
 			b.join(c)
 		case c := <-b.unregister:
 			b.detach(c, false)
-		case in := <-b.inbound:
-			b.handle(in)
 		case msg, ok := <-msgs:
 			if !ok {
 				msgs = nil // subscription ended; stop selecting it
 				continue
 			}
-			b.deliverReliable(msg, nil) // loop-back fan-out to local clients
-		case s := <-b.snapshots:
-			if s.c.present {
-				b.push(s.c, s.data)
+			b.dispatch(msg)
+		case d := <-b.direct:
+			if d.c.present {
+				b.push(d.c, d.data)
 			}
 		case ch := <-b.inspect:
 			ch <- len(b.clients)
@@ -108,83 +97,36 @@ func (b *Board) run() {
 	}
 }
 
-// join admits a client: it tells existing local participants the newcomer
-// arrived, adds it to the set, and sends the presence roster. The document
-// snapshot is delivered separately (fetched from the broker off this goroutine).
+// join adds a client to the local fan-out set. Presence is announced by the
+// connection goroutine through the broker, not here.
 func (b *Board) join(c *Client) {
-	b.announceJoin(c)
 	b.clients[c] = struct{}{}
+	b.byID[c.id] = c
 	c.present = true
-	b.sendPresenceState(c)
 	b.log.Debug("client joined", "client", c.id, "clients", len(b.clients))
 }
 
-// handle processes a locally-handled client message. In this phase that is
-// cursor moves: stamped with the origin id and relayed best-effort to the other
-// local clients (dropped, never buffered, under backpressure).
-func (b *Board) handle(in inbound) {
-	switch in.env.Type {
-	case protocol.TypeCursor:
+// dispatch routes a message received from the broker to local clients by type:
+// cursor updates are best-effort and skip the origin (if it is on this
+// instance); everything else (shape ops, presence events) is reliable to all.
+func (b *Board) dispatch(msg []byte) {
+	var env protocol.Envelope
+	if err := json.Unmarshal(msg, &env); err != nil {
+		b.deliverReliable(msg, nil) // unknown framing: deliver rather than drop
+		return
+	}
+	if env.Type == protocol.TypeCursor {
 		var cur protocol.Cursor
-		if err := in.env.DecodePayload(&cur); err != nil {
-			b.log.Warn("dropping invalid cursor", "err", err)
-			return
-		}
-		cur.ClientID = in.origin.id // stamp authoritative id; clients can't spoof
-		out, err := protocol.Marshal(protocol.TypeCursor, 0, cur)
-		if err != nil {
-			return
-		}
-		b.deliverBestEffort(out, in.origin)
-	default:
-		b.log.Warn("ignoring unexpected message type", "type", in.env.Type)
-	}
-}
-
-// sendPresenceState sends a joining client the local presence roster (itself
-// plus the other clients on this instance).
-func (b *Board) sendPresenceState(c *Client) {
-	others := make([]protocol.Presence, 0, len(b.clients))
-	for o := range b.clients {
-		if o == c {
-			continue
-		}
-		others = append(others, o.presence())
-	}
-	data, err := protocol.Marshal(protocol.TypePresenceState, 0, protocol.PresenceState{
-		Self:   c.presence(),
-		Others: others,
-	})
-	if err != nil {
-		b.log.Error("failed to encode presence state", "err", err)
+		_ = env.DecodePayload(&cur)
+		b.deliverBestEffort(msg, b.byID[cur.ClientID]) // exclude local origin if present
 		return
 	}
-	b.push(c, data)
-}
-
-func (b *Board) announceJoin(c *Client) {
-	data, err := protocol.Marshal(protocol.TypePresenceJoin, 0, c.presence())
-	if err != nil {
-		b.log.Error("failed to encode presence join", "err", err)
-		return
-	}
-	b.deliverReliable(data, nil)
-}
-
-func (b *Board) announceLeave(c *Client) {
-	data, err := protocol.Marshal(protocol.TypePresenceLeave, 0, protocol.Presence{ClientID: c.id})
-	if err != nil {
-		b.log.Error("failed to encode presence leave", "err", err)
-		return
-	}
-	b.deliverReliable(data, nil)
+	b.deliverReliable(msg, nil)
 }
 
 // deliverReliable sends data to every client except exclude (nil means all),
 // guaranteeing delivery for clients that keep up. A client whose buffer is full
-// is collected and kicked AFTER the loop completes — never during iteration — so
-// the follow-on presence.leave fan-out cannot recurse into a map we are still
-// ranging.
+// is collected and kicked AFTER the loop completes — never during iteration.
 func (b *Board) deliverReliable(data []byte, exclude *Client) {
 	var slow []*Client
 	for c := range b.clients {
@@ -231,22 +173,21 @@ func (b *Board) push(c *Client, data []byte) bool {
 	}
 }
 
-// detach removes a client from the board: it stops fan-out to the client, closes
-// its send channel, optionally closes its connection (to unblock the read pump
-// when the board initiated the removal), and announces its departure to the
-// remaining clients. The present flag makes this idempotent, so a client that is
-// kicked and then unregistered is announced exactly once.
+// detach removes a client from the board and closes its send channel, optionally
+// closing its connection to unblock the read pump. The present flag makes this
+// idempotent (kicked, then unregistered). Departure is announced by the
+// connection goroutine through the broker, not here.
 func (b *Board) detach(c *Client, closeConn bool) {
 	if !c.present {
 		return
 	}
 	c.present = false
 	delete(b.clients, c)
+	delete(b.byID, c.id)
 	close(c.send)
 	if closeConn {
 		_ = c.conn.Close()
 	}
-	b.announceLeave(c)
 }
 
 // shutdown drains every remaining client when the board stops.
@@ -254,6 +195,7 @@ func (b *Board) shutdown() {
 	for c := range b.clients {
 		c.present = false
 		delete(b.clients, c)
+		delete(b.byID, c.id)
 		close(c.send)
 		_ = c.conn.Close()
 	}

@@ -61,8 +61,9 @@ type Client struct {
 	send    chan []byte
 	log     *slog.Logger
 
-	// present is owned by the board goroutine. It guards against announcing a
-	// client's departure more than once (e.g. kicked, then unregistered).
+	// present is owned by the board goroutine. It makes detach idempotent so a
+	// client that is kicked and then unregistered has its send channel closed
+	// exactly once.
 	present bool
 }
 
@@ -121,20 +122,13 @@ func (h *Hub) Serve(ctx context.Context, boardID string, info ClientInfo, conn C
 
 	c.board.register <- c
 
-	// Fetch the current board snapshot from the broker off the board goroutine
-	// (it is network I/O), then hand it to the board to deliver — keeping the
-	// board the sole writer of c.send. The client is already registered, so any
-	// op published after this point is delivered live; the client reconciles
-	// snapshot and live ops by sequence number.
-	if snap, err := c.board.broker.Snapshot(ctx, boardID); err != nil {
-		c.log.Warn("snapshot fetch failed", "err", err)
-	} else if data, err := protocol.Marshal(protocol.TypeSnapshot, 0, snap); err == nil {
-		select {
-		case c.board.snapshots <- snapshotReq{c: c, data: data}:
-		case <-c.board.done:
-		case <-ctx.Done():
-		}
-	}
+	// Join the global roster and announce arrival, then deliver this client its
+	// snapshot and presence roster. All of this is broker I/O done off the board
+	// goroutine; the client is already registered, so any op published after
+	// this point is delivered live and reconciled by sequence number.
+	c.joinPresence(ctx)
+	c.sendSnapshot(ctx)
+	c.sendPresenceState(ctx)
 
 	// A connection-scoped context so that when one pump stops, the other
 	// unwinds promptly.
@@ -153,6 +147,10 @@ func (h *Hub) Serve(ctx context.Context, boardID string, info ClientInfo, conn C
 	cancel()           // signal the write pump to stop
 	_ = c.conn.Close() // unblock anything stuck in a read/write
 	wg.Wait()          // ensure the write pump is gone before we release
+
+	// Leave the global roster and announce departure (uses a fresh context
+	// because the connection context is already cancelled).
+	c.leavePresence()
 }
 
 // readPump reads inbound messages, parses the envelope, and hands them to the
@@ -177,18 +175,15 @@ func (c *Client) readPump(ctx context.Context) {
 		}
 		switch env.Type {
 		case protocol.TypeShapeCreate, protocol.TypeShapeUpdate, protocol.TypeShapeDelete:
-			// Shape ops are sequenced and stored via the broker off the board
-			// goroutine; the loop-back subscription delivers them to clients.
+			// Shape ops are sequenced and stored via the broker; the loop-back
+			// subscription delivers them to clients.
 			c.applyShapeOp(ctx, env)
+		case protocol.TypeCursor:
+			// Cursors are published to the broker so they cross instances; the
+			// board relays them best-effort.
+			c.publishCursor(ctx, env)
 		default:
-			// Locally-handled messages (cursors) go to the board.
-			select {
-			case c.board.inbound <- inbound{origin: c, env: env}:
-			case <-c.board.done: // board is shutting down
-				return
-			case <-ctx.Done():
-				return
-			}
+			c.log.Warn("ignoring unexpected message type", "type", env.Type)
 		}
 	}
 }
@@ -214,6 +209,98 @@ func (c *Client) applyShapeOp(ctx context.Context, env protocol.Envelope) {
 	}
 	if err := c.board.broker.Publish(ctx, c.boardID, msg); err != nil {
 		c.log.Error("broker publish failed", "err", err)
+	}
+}
+
+// joinPresence adds the client to the broker's global roster and publishes a
+// presence.join so clients on every instance learn it arrived.
+func (c *Client) joinPresence(ctx context.Context) {
+	if data, err := json.Marshal(c.presence()); err != nil {
+		c.log.Error("encode presence failed", "err", err)
+	} else if err := c.board.broker.SetPresence(ctx, c.boardID, c.id, data); err != nil {
+		c.log.Warn("set presence failed", "err", err)
+	}
+	if msg, err := protocol.Marshal(protocol.TypePresenceJoin, 0, c.presence()); err == nil {
+		if err := c.board.broker.Publish(ctx, c.boardID, msg); err != nil {
+			c.log.Warn("publish presence join failed", "err", err)
+		}
+	}
+}
+
+// leavePresence removes the client from the roster and announces its departure.
+func (c *Client) leavePresence() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.board.broker.RemovePresence(ctx, c.boardID, c.id); err != nil {
+		c.log.Warn("remove presence failed", "err", err)
+	}
+	if msg, err := protocol.Marshal(protocol.TypePresenceLeave, 0, protocol.Presence{ClientID: c.id}); err == nil {
+		if err := c.board.broker.Publish(ctx, c.boardID, msg); err != nil {
+			c.log.Warn("publish presence leave failed", "err", err)
+		}
+	}
+}
+
+// sendSnapshot fetches the current document from the broker and delivers it to
+// this client through the board (which stays the sole writer of c.send).
+func (c *Client) sendSnapshot(ctx context.Context) {
+	snap, err := c.board.broker.Snapshot(ctx, c.boardID)
+	if err != nil {
+		c.log.Warn("snapshot fetch failed", "err", err)
+		return
+	}
+	if data, err := protocol.Marshal(protocol.TypeSnapshot, 0, snap); err == nil {
+		c.deliverDirect(ctx, data)
+	}
+}
+
+// sendPresenceState fetches the global roster and delivers this client its
+// presence.state: itself plus everyone else, on any instance.
+func (c *Client) sendPresenceState(ctx context.Context) {
+	roster, err := c.board.broker.Presence(ctx, c.boardID)
+	if err != nil {
+		c.log.Warn("presence fetch failed", "err", err)
+		return
+	}
+	others := make([]protocol.Presence, 0, len(roster))
+	for _, p := range roster {
+		if p.ClientID == c.id {
+			continue
+		}
+		others = append(others, p)
+	}
+	if data, err := protocol.Marshal(protocol.TypePresenceState, 0, protocol.PresenceState{
+		Self:   c.presence(),
+		Others: others,
+	}); err == nil {
+		c.deliverDirect(ctx, data)
+	}
+}
+
+// deliverDirect hands data to the board for delivery to this specific client.
+func (c *Client) deliverDirect(ctx context.Context, data []byte) {
+	select {
+	case c.board.direct <- clientMsg{c: c, data: data}:
+	case <-c.board.done:
+	case <-ctx.Done():
+	}
+}
+
+// publishCursor stamps the origin id onto a cursor and publishes it to the
+// broker so it reaches clients on every instance.
+func (c *Client) publishCursor(ctx context.Context, env protocol.Envelope) {
+	var cur protocol.Cursor
+	if err := env.DecodePayload(&cur); err != nil {
+		c.log.Warn("dropping invalid cursor", "err", err)
+		return
+	}
+	cur.ClientID = c.id
+	msg, err := protocol.Marshal(protocol.TypeCursor, 0, cur)
+	if err != nil {
+		return
+	}
+	if err := c.board.broker.Publish(ctx, c.boardID, msg); err != nil {
+		c.log.Debug("cursor publish failed", "err", err)
 	}
 }
 
