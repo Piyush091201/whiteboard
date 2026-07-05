@@ -44,6 +44,16 @@ type Broker interface {
 	// Snapshot returns the board's current shapes, ordered by sequence.
 	Snapshot(ctx context.Context, boardID string) (protocol.Snapshot, error)
 
+	// SetPresence adds or updates a participant in the board's global roster.
+	// presence is the encoded protocol.Presence.
+	SetPresence(ctx context.Context, boardID, clientID string, presence []byte) error
+
+	// RemovePresence removes a participant from the board's global roster.
+	RemovePresence(ctx context.Context, boardID, clientID string) error
+
+	// Presence returns the board's current roster across all instances.
+	Presence(ctx context.Context, boardID string) ([]protocol.Presence, error)
+
 	// Close releases resources held by the broker.
 	Close() error
 }

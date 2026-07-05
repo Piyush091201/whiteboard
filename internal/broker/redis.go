@@ -42,9 +42,10 @@ type Redis struct {
 // NewRedis wraps a go-redis client as a Broker.
 func NewRedis(rdb *redis.Client) *Redis { return &Redis{rdb: rdb} }
 
-func seqKey(boardID string) string     { return "board:" + boardID + ":seq" }
-func shapesKey(boardID string) string  { return "board:" + boardID + ":shapes" }
-func channelKey(boardID string) string { return "board:" + boardID }
+func seqKey(boardID string) string      { return "board:" + boardID + ":seq" }
+func shapesKey(boardID string) string   { return "board:" + boardID + ":shapes" }
+func presenceKey(boardID string) string { return "board:" + boardID + ":presence" }
+func channelKey(boardID string) string  { return "board:" + boardID }
 
 func (r *Redis) ApplyShape(ctx context.Context, boardID, shapeID string, shape []byte, del bool) (uint64, error) {
 	delArg := "0"
@@ -124,6 +125,31 @@ func (r *Redis) Snapshot(ctx context.Context, boardID string) (protocol.Snapshot
 		return protocol.Snapshot{}, err
 	}
 	return protocol.Snapshot{Seq: cur, Shapes: shapes}, nil
+}
+
+func (r *Redis) SetPresence(ctx context.Context, boardID, clientID string, presence []byte) error {
+	return r.rdb.HSet(ctx, presenceKey(boardID), clientID, presence).Err()
+}
+
+func (r *Redis) RemovePresence(ctx context.Context, boardID, clientID string) error {
+	return r.rdb.HDel(ctx, presenceKey(boardID), clientID).Err()
+}
+
+func (r *Redis) Presence(ctx context.Context, boardID string) ([]protocol.Presence, error) {
+	fields, err := r.rdb.HGetAll(ctx, presenceKey(boardID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]protocol.Presence, 0, len(fields))
+	for _, raw := range fields {
+		var p protocol.Presence
+		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ClientID < out[j].ClientID })
+	return out, nil
 }
 
 func (r *Redis) Close() error { return r.rdb.Close() }

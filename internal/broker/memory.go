@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
 	"sync"
 
@@ -18,9 +19,10 @@ type Memory struct {
 }
 
 type memBoard struct {
-	seq    uint64
-	shapes map[string]memShape
-	subs   map[*memSub]struct{}
+	seq      uint64
+	shapes   map[string]memShape
+	presence map[string][]byte
+	subs     map[*memSub]struct{}
 }
 
 type memShape struct {
@@ -42,8 +44,9 @@ func (m *Memory) board(id string) *memBoard {
 	b := m.boards[id]
 	if b == nil {
 		b = &memBoard{
-			shapes: make(map[string]memShape),
-			subs:   make(map[*memSub]struct{}),
+			shapes:   make(map[string]memShape),
+			presence: make(map[string][]byte),
+			subs:     make(map[*memSub]struct{}),
 		}
 		m.boards[id] = b
 	}
@@ -128,6 +131,40 @@ func (m *Memory) Snapshot(_ context.Context, boardID string) (protocol.Snapshot,
 	}
 	sort.Slice(shapes, func(i, j int) bool { return shapes[i].Seq < shapes[j].Seq })
 	return protocol.Snapshot{Seq: b.seq, Shapes: shapes}, nil
+}
+
+// SetPresence adds or updates a participant in the roster.
+func (m *Memory) SetPresence(_ context.Context, boardID, clientID string, presence []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.board(boardID).presence[clientID] = append([]byte(nil), presence...)
+	return nil
+}
+
+// RemovePresence removes a participant from the roster.
+func (m *Memory) RemovePresence(_ context.Context, boardID, clientID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.board(boardID).presence, clientID)
+	return nil
+}
+
+// Presence returns the roster ordered by client id (stable output).
+func (m *Memory) Presence(_ context.Context, boardID string) ([]protocol.Presence, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	b := m.board(boardID)
+	out := make([]protocol.Presence, 0, len(b.presence))
+	for _, raw := range b.presence {
+		var p protocol.Presence
+		if err := json.Unmarshal(raw, &p); err != nil {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ClientID < out[j].ClientID })
+	return out, nil
 }
 
 // Close is a no-op for the in-process broker.

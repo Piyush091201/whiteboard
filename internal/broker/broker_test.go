@@ -129,6 +129,44 @@ func TestPubSubDeliversToAllSubscribers(t *testing.T) {
 	})
 }
 
+// TestPresenceRoster verifies the global roster: participants can be added,
+// listed (ordered), and removed — the state a joiner reads to see who is present
+// across all instances.
+func TestPresenceRoster(t *testing.T) {
+	withBrokers(t, func(t *testing.T, b broker.Broker) {
+		ctx := context.Background()
+
+		if err := b.SetPresence(ctx, "room", "u1", []byte(`{"clientId":"u1","name":"Ada"}`)); err != nil {
+			t.Fatalf("set u1: %v", err)
+		}
+		if err := b.SetPresence(ctx, "room", "u2", []byte(`{"clientId":"u2","name":"Bob"}`)); err != nil {
+			t.Fatalf("set u2: %v", err)
+		}
+
+		roster, err := b.Presence(ctx, "room")
+		if err != nil {
+			t.Fatalf("presence: %v", err)
+		}
+		if len(roster) != 2 || roster[0].ClientID != "u1" || roster[1].ClientID != "u2" {
+			t.Fatalf("roster = %+v, want [u1 u2]", roster)
+		}
+		if roster[0].Name != "Ada" {
+			t.Errorf("u1 name = %q, want Ada", roster[0].Name)
+		}
+
+		if err := b.RemovePresence(ctx, "room", "u1"); err != nil {
+			t.Fatalf("remove u1: %v", err)
+		}
+		roster, err = b.Presence(ctx, "room")
+		if err != nil {
+			t.Fatalf("presence after remove: %v", err)
+		}
+		if len(roster) != 1 || roster[0].ClientID != "u2" {
+			t.Fatalf("roster after remove = %+v, want [u2]", roster)
+		}
+	})
+}
+
 func mustApply(t *testing.T, b broker.Broker, board, id, shape string) {
 	t.Helper()
 	if _, err := b.ApplyShape(context.Background(), board, id, []byte(shape), false); err != nil {
