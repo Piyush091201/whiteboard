@@ -25,9 +25,10 @@ type clientMsg struct {
 // For a C# developer: still the actor model, but the board is now a thin
 // per-instance projection of shared state rather than the owner of it.
 type Board struct {
-	id     string
-	log    *slog.Logger
-	broker broker.Broker
+	id      string
+	log     *slog.Logger
+	broker  broker.Broker
+	persist *persistence // nil when persistence is disabled
 
 	register   chan *Client
 	unregister chan *Client
@@ -40,11 +41,12 @@ type Board struct {
 	byID    map[string]*Client // id -> client, for excluding a cursor's origin
 }
 
-func newBoard(id string, log *slog.Logger, b broker.Broker) *Board {
+func newBoard(id string, log *slog.Logger, b broker.Broker, p *persistence) *Board {
 	return &Board{
 		id:         id,
 		log:        log.With("board", id),
 		broker:     b,
+		persist:    p,
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		direct:     make(chan clientMsg),
@@ -62,6 +64,11 @@ func newBoard(id string, log *slog.Logger, b broker.Broker) *Board {
 // loop-back) reaches everyone the same way. It exits when the hub closes b.quit.
 func (b *Board) run() {
 	defer close(b.done)
+
+	// Cold-start hydration happens before the select loop, so the first client's
+	// register (which blocks until we reach the loop) is served only after the
+	// board's durable state has been loaded.
+	b.hydrate()
 
 	subCtx, cancelSub := context.WithCancel(context.Background())
 	defer cancelSub()
@@ -92,9 +99,30 @@ func (b *Board) run() {
 			ch <- len(b.clients)
 		case <-b.quit:
 			b.shutdown()
+			b.persistOnClose() // final durable checkpoint before the board is gone
 			return
 		}
 	}
+}
+
+// hydrate loads durable state on cold start (no-op when persistence is off).
+func (b *Board) hydrate() {
+	if b.persist == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
+	defer cancel()
+	b.persist.hydrate(ctx, b.id)
+}
+
+// persistOnClose saves a final snapshot when the board's last client leaves.
+func (b *Board) persistOnClose() {
+	if b.persist == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
+	defer cancel()
+	b.persist.save(ctx, b.id)
 }
 
 // join adds a client to the local fan-out set. Presence is announced by the

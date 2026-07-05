@@ -14,10 +14,13 @@
 package hub
 
 import (
+	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/Piyush091201/whiteboard/internal/broker"
+	"github.com/Piyush091201/whiteboard/internal/store"
 )
 
 // boardEntry tracks a live board plus the number of clients keeping it open.
@@ -32,20 +35,72 @@ type boardEntry struct {
 
 // Hub is the registry of active boards. It is safe for concurrent use.
 type Hub struct {
-	log    *slog.Logger
-	broker broker.Broker
+	log     *slog.Logger
+	broker  broker.Broker
+	persist *persistence // nil when persistence is disabled
 
 	mu     sync.Mutex
 	boards map[string]*boardEntry
+
+	stop chan struct{}  // closed by Close to stop the coordinator
+	wg   sync.WaitGroup // tracks the coordinator goroutine
 }
 
-// New constructs a Hub backed by the given broker (which holds shared board
-// state and the message bus). A nil logger falls back to slog.Default().
-func New(log *slog.Logger, b broker.Broker) *Hub {
+// New constructs a Hub backed by the given broker (shared state and message bus)
+// and an optional durable store. A nil store disables persistence; a nil logger
+// falls back to slog.Default(). When a store is provided, a coordinator
+// goroutine periodically snapshots active boards; call Close to stop it.
+func New(log *slog.Logger, b broker.Broker, s store.Store) *Hub {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Hub{log: log, broker: b, boards: make(map[string]*boardEntry)}
+	h := &Hub{log: log, broker: b, boards: make(map[string]*boardEntry)}
+	if s != nil {
+		h.persist = &persistence{broker: b, store: s, log: log}
+		h.stop = make(chan struct{})
+		h.wg.Add(1)
+		go h.snapshotLoop(snapshotInterval)
+	}
+	return h
+}
+
+// Close stops the persistence coordinator. It is safe to call when persistence
+// is disabled (a no-op).
+func (h *Hub) Close() {
+	if h.stop != nil {
+		close(h.stop)
+		h.wg.Wait()
+	}
+}
+
+// snapshotLoop periodically persists every active board until Close is called.
+func (h *Hub) snapshotLoop(interval time.Duration) {
+	defer h.wg.Done()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			h.snapshotAllBoards()
+		case <-h.stop:
+			return
+		}
+	}
+}
+
+func (h *Hub) snapshotAllBoards() {
+	h.mu.Lock()
+	ids := make([]string, 0, len(h.boards))
+	for id := range h.boards {
+		ids = append(ids, id)
+	}
+	h.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
+	defer cancel()
+	for _, id := range ids {
+		h.persist.save(ctx, id)
+	}
 }
 
 // acquire returns the board for id, creating and starting it if necessary, and
@@ -57,7 +112,7 @@ func (h *Hub) acquire(id string) *Board {
 
 	e, ok := h.boards[id]
 	if !ok {
-		e = &boardEntry{board: newBoard(id, h.log, h.broker)}
+		e = &boardEntry{board: newBoard(id, h.log, h.broker, h.persist)}
 		h.boards[id] = e
 		go e.board.run()
 	}

@@ -22,6 +22,7 @@ import (
 
 	"github.com/Piyush091201/whiteboard/internal/broker"
 	"github.com/Piyush091201/whiteboard/internal/hub"
+	"github.com/Piyush091201/whiteboard/internal/store"
 	"github.com/Piyush091201/whiteboard/internal/ws"
 )
 
@@ -34,6 +35,7 @@ import (
 type config struct {
 	addr            string        // host:port the HTTP server listens on
 	redisAddr       string        // Redis host:port; empty => in-memory single-instance broker
+	databaseURL     string        // Postgres DSN; empty => persistence disabled
 	shutdownTimeout time.Duration // how long to wait for in-flight requests to drain
 }
 
@@ -41,6 +43,7 @@ func loadConfig() config {
 	return config{
 		addr:            getenv("WB_ADDR", ":8080"),
 		redisAddr:       getenv("WB_REDIS_ADDR", ""),
+		databaseURL:     getenv("WB_DATABASE_URL", ""),
 		shutdownTimeout: 15 * time.Second,
 	}
 }
@@ -70,6 +73,21 @@ func newBroker(ctx context.Context, logger *slog.Logger, cfg config) (broker.Bro
 	}
 	logger.Info("using redis broker", "addr", cfg.redisAddr)
 	return broker.NewRedis(rdb), nil
+}
+
+// newStore builds the durable store from configuration. With no database URL it
+// returns a nil store, which disables persistence.
+func newStore(ctx context.Context, logger *slog.Logger, cfg config) (store.Store, error) {
+	if cfg.databaseURL == "" {
+		logger.Info("persistence disabled (no WB_DATABASE_URL)")
+		return nil, nil
+	}
+	pg, err := store.NewPostgres(ctx, cfg.databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect to postgres: %w", err)
+	}
+	logger.Info("using postgres persistence")
+	return pg, nil
 }
 
 func main() {
@@ -114,7 +132,16 @@ func run(logger *slog.Logger) error {
 	}
 	defer func() { _ = b.Close() }()
 
-	h := hub.New(logger, b)
+	st, err := newStore(ctx, logger, cfg)
+	if err != nil {
+		return err
+	}
+	if st != nil {
+		defer func() { _ = st.Close() }()
+	}
+
+	h := hub.New(logger, b, st)
+	defer h.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {

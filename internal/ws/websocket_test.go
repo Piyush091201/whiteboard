@@ -23,7 +23,7 @@ import (
 // operation from one is sequenced by the hub and fanned out to the other.
 func TestWebSocketEndToEnd(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := hub.New(logger, broker.NewMemory())
+	h := hub.New(logger, broker.NewMemory(), nil)
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /ws/{board}", Handler(h))
