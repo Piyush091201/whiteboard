@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -13,6 +14,22 @@ import (
 	"github.com/Piyush091201/whiteboard/internal/protocol"
 	"github.com/Piyush091201/whiteboard/internal/store"
 )
+
+// jsonEqual compares two JSON blobs by value. Postgres JSONB canonicalizes JSON
+// (whitespace, key order), so a round-tripped shape is semantically equal but
+// not byte-identical to the original — which is fine, shape blobs are opaque
+// JSON to the server.
+func jsonEqual(t *testing.T, a, b []byte) bool {
+	t.Helper()
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		t.Fatalf("unmarshal %s: %v", a, err)
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		t.Fatalf("unmarshal %s: %v", b, err)
+	}
+	return reflect.DeepEqual(av, bv)
+}
 
 // startPostgres spins a throwaway Postgres via testcontainers. It skips the test
 // when Docker is unavailable (e.g. local dev without Docker), so the SQL is
@@ -71,7 +88,8 @@ func TestPostgresStoreRoundTrip(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("load = (ok=%v, err=%v), want present", ok, err)
 	}
-	if got.Seq != 2 || len(got.Shapes) != 1 || string(got.Shapes[0].Shape) != `{"kind":"rect"}` {
+	if got.Seq != 2 || len(got.Shapes) != 1 || got.Shapes[0].ID != "s1" ||
+		!jsonEqual(t, got.Shapes[0].Shape, []byte(`{"kind":"rect"}`)) {
 		t.Fatalf("loaded snapshot = %+v, want the saved one", got)
 	}
 }
