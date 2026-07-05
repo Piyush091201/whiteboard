@@ -13,7 +13,7 @@ import (
 // present (presence.state) and that existing clients are told about the
 // newcomer (presence.join).
 func TestPresenceJoinAndState(t *testing.T) {
-	h := New(testLogger(), broker.NewMemory())
+	h := New(testLogger(), broker.NewMemory(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a := newFakeConn(8)
@@ -59,7 +59,7 @@ func TestPresenceJoinAndState(t *testing.T) {
 // TestCursorRelayExcludesOrigin verifies that a cursor move is relayed to other
 // clients, stamped with the origin's id, and not echoed back to the sender.
 func TestCursorRelayExcludesOrigin(t *testing.T) {
-	h := New(testLogger(), broker.NewMemory())
+	h := New(testLogger(), broker.NewMemory(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a := newFakeConn(8)
@@ -93,7 +93,7 @@ func TestCursorRelayExcludesOrigin(t *testing.T) {
 // TestPresenceLeaveOnDisconnect verifies that remaining clients are notified
 // when a participant disconnects.
 func TestPresenceLeaveOnDisconnect(t *testing.T) {
-	h := New(testLogger(), broker.NewMemory())
+	h := New(testLogger(), broker.NewMemory(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a := newFakeConn(8)
@@ -124,7 +124,7 @@ func TestPresenceLeaveOnDisconnect(t *testing.T) {
 // client flooded with cursor updates has them dropped rather than being
 // disconnected (unlike reliable traffic, which would kick it).
 func TestCursorDroppedNotKicked(t *testing.T) {
-	h := New(testLogger(), broker.NewMemory())
+	h := New(testLogger(), broker.NewMemory(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	fast := newFakeConn(8) // origin of the cursor flood; drained below

@@ -200,7 +200,7 @@ func waitForBoardGone(t *testing.T, h *Hub, board string) {
 // assigned an authoritative sequence number and delivered to every client,
 // including the origin.
 func TestFanoutSequencesAndDelivers(t *testing.T) {
-	h := New(testLogger(), broker.NewMemory())
+	h := New(testLogger(), broker.NewMemory(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a := newFakeConn(8)
@@ -233,7 +233,7 @@ func TestFanoutSequencesAndDelivers(t *testing.T) {
 // TestSnapshotOnJoin verifies that a client joining a board with existing state
 // receives that state as a snapshot.
 func TestSnapshotOnJoin(t *testing.T) {
-	h := New(testLogger(), broker.NewMemory())
+	h := New(testLogger(), broker.NewMemory(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a := newFakeConn(8)
@@ -267,7 +267,7 @@ func TestSnapshotOnJoin(t *testing.T) {
 // fully torn down once they all disconnect. Combined with goleak in TestMain,
 // this proves the connection lifecycle leaves nothing behind.
 func TestLifecycleCleanup(t *testing.T) {
-	h := New(testLogger(), broker.NewMemory())
+	h := New(testLogger(), broker.NewMemory(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	const n = 5
@@ -290,7 +290,7 @@ func TestLifecycleCleanup(t *testing.T) {
 // the board on reliable traffic: it is kicked once its buffer overflows, while
 // a healthy client on the same board keeps working.
 func TestBackpressureKicksSlowClient(t *testing.T) {
-	h := New(testLogger(), broker.NewMemory())
+	h := New(testLogger(), broker.NewMemory(), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	fast := newFakeConn(8) // its outbound is drained below, so it never backs up

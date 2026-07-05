@@ -15,8 +15,8 @@ import (
 // an identical snapshot.
 func TestCrossInstanceShapeSync(t *testing.T) {
 	bk := broker.NewMemory() // one shared bus/state for both instances
-	h1 := New(testLogger(), bk)
-	h2 := New(testLogger(), bk)
+	h1 := New(testLogger(), bk, nil)
+	h2 := New(testLogger(), bk, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -61,8 +61,8 @@ func TestCrossInstanceShapeSync(t *testing.T) {
 // and departures cross instances too.
 func TestCrossInstancePresenceAndCursors(t *testing.T) {
 	bk := broker.NewMemory()
-	h1 := New(testLogger(), bk)
-	h2 := New(testLogger(), bk)
+	h1 := New(testLogger(), bk, nil)
+	h2 := New(testLogger(), bk, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 

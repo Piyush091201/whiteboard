@@ -9,6 +9,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Piyush091201/whiteboard/internal/broker"
+	"github.com/Piyush091201/whiteboard/internal/protocol"
 )
 
 // withBrokers runs fn against every Broker implementation, so the contract is
@@ -163,6 +164,52 @@ func TestPresenceRoster(t *testing.T) {
 		}
 		if len(roster) != 1 || roster[0].ClientID != "u2" {
 			t.Fatalf("roster after remove = %+v, want [u2]", roster)
+		}
+	})
+}
+
+// TestHydrateIsIdempotent verifies cold-start hydration loads a snapshot into an
+// empty board and refuses to clobber a board that already has state.
+func TestHydrateIsIdempotent(t *testing.T) {
+	withBrokers(t, func(t *testing.T, b broker.Broker) {
+		ctx := context.Background()
+		snap := protocol.Snapshot{
+			Seq: 7,
+			Shapes: []protocol.SnapshotShape{
+				{Seq: 5, ID: "a", Shape: []byte(`"va"`)},
+				{Seq: 7, ID: "b", Shape: []byte(`"vb"`)},
+			},
+		}
+
+		loaded, err := b.Hydrate(ctx, "room", snap)
+		if err != nil || !loaded {
+			t.Fatalf("first hydrate = (%v, %v), want (true, nil)", loaded, err)
+		}
+
+		got, err := b.Snapshot(ctx, "room")
+		if err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		if got.Seq != 7 || len(got.Shapes) != 2 {
+			t.Fatalf("hydrated snapshot = %+v, want seq 7 with 2 shapes", got)
+		}
+
+		// A subsequent write continues from the hydrated sequence, not from zero.
+		seq, err := b.ApplyShape(ctx, "room", "c", []byte(`"vc"`), false)
+		if err != nil {
+			t.Fatalf("apply after hydrate: %v", err)
+		}
+		if seq != 8 {
+			t.Fatalf("seq after hydrate = %d, want 8", seq)
+		}
+
+		// Hydrating a non-empty board is a no-op.
+		loaded, err = b.Hydrate(ctx, "room", protocol.Snapshot{Seq: 99})
+		if err != nil {
+			t.Fatalf("second hydrate: %v", err)
+		}
+		if loaded {
+			t.Fatal("hydrate clobbered a board that already had state")
 		}
 	})
 }

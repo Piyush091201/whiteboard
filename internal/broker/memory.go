@@ -133,6 +133,22 @@ func (m *Memory) Snapshot(_ context.Context, boardID string) (protocol.Snapshot,
 	return protocol.Snapshot{Seq: b.seq, Shapes: shapes}, nil
 }
 
+// Hydrate loads a snapshot into the board only if it is currently empty.
+func (m *Memory) Hydrate(_ context.Context, boardID string, snap protocol.Snapshot) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	b := m.board(boardID)
+	if b.seq != 0 || len(b.shapes) > 0 {
+		return false, nil // already has state
+	}
+	b.seq = snap.Seq
+	for _, s := range snap.Shapes {
+		b.shapes[s.ID] = memShape{seq: s.Seq, shape: append([]byte(nil), s.Shape...)}
+	}
+	return true, nil
+}
+
 // SetPresence adds or updates a participant in the roster.
 func (m *Memory) SetPresence(_ context.Context, boardID, clientID string, presence []byte) error {
 	m.mu.Lock()

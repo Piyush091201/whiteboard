@@ -32,6 +32,23 @@ end
 return seq
 `)
 
+// hydrateScript loads a snapshot into a board only if it has no state yet
+// (the sequence key does not exist), making cold-start hydration idempotent
+// across instances.
+//
+// KEYS[1] = seq counter key, KEYS[2] = shapes hash key.
+// ARGV[1] = board sequence, then (shapeId, "<seq>\n<blob>") pairs.
+var hydrateScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1])
+for i = 2, #ARGV, 2 do
+  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i+1])
+end
+return 1
+`)
+
 // Redis is the multi-instance Broker backed by a Redis server: INCR for the
 // global sequence, a HASH for authoritative shape state, and pub/sub for
 // fan-out.
@@ -125,6 +142,21 @@ func (r *Redis) Snapshot(ctx context.Context, boardID string) (protocol.Snapshot
 		return protocol.Snapshot{}, err
 	}
 	return protocol.Snapshot{Seq: cur, Shapes: shapes}, nil
+}
+
+func (r *Redis) Hydrate(ctx context.Context, boardID string, snap protocol.Snapshot) (bool, error) {
+	argv := make([]any, 0, 1+2*len(snap.Shapes))
+	argv = append(argv, snap.Seq)
+	for _, s := range snap.Shapes {
+		argv = append(argv, s.ID, strconv.FormatUint(s.Seq, 10)+"\n"+string(s.Shape))
+	}
+	loaded, err := hydrateScript.Run(ctx, r.rdb,
+		[]string{seqKey(boardID), shapesKey(boardID)}, argv...,
+	).Int64()
+	if err != nil {
+		return false, err
+	}
+	return loaded == 1, nil
 }
 
 func (r *Redis) SetPresence(ctx context.Context, boardID, clientID string, presence []byte) error {
