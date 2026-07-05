@@ -37,7 +37,7 @@ func TestPersistAndHydrate(t *testing.T) {
 
 	// --- instance 1: draw a shape, then disconnect so the board persists ---
 	b1 := broker.NewMemory()
-	h1 := New(testLogger(), b1, st)
+	h1 := New(testLogger(), b1, WithStore(st))
 	defer h1.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -59,7 +59,7 @@ func TestPersistAndHydrate(t *testing.T) {
 
 	// --- instance 2: a fresh broker (simulating a restart) rehydrates ---
 	b2 := broker.NewMemory()
-	h2 := New(testLogger(), b2, st)
+	h2 := New(testLogger(), b2, WithStore(st))
 	defer h2.Close()
 
 	c := newFakeConn(8)

@@ -29,6 +29,7 @@ type Board struct {
 	log     *slog.Logger
 	broker  broker.Broker
 	persist *persistence // nil when persistence is disabled
+	metrics Metrics
 
 	register   chan *Client
 	unregister chan *Client
@@ -41,12 +42,13 @@ type Board struct {
 	byID    map[string]*Client // id -> client, for excluding a cursor's origin
 }
 
-func newBoard(id string, log *slog.Logger, b broker.Broker, p *persistence) *Board {
+func newBoard(id string, log *slog.Logger, b broker.Broker, p *persistence, m Metrics) *Board {
 	return &Board{
 		id:         id,
 		log:        log.With("board", id),
 		broker:     b,
 		persist:    p,
+		metrics:    m,
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		direct:     make(chan clientMsg),
@@ -156,6 +158,7 @@ func (b *Board) dispatch(msg []byte) {
 // guaranteeing delivery for clients that keep up. A client whose buffer is full
 // is collected and kicked AFTER the loop completes — never during iteration.
 func (b *Board) deliverReliable(data []byte, exclude *Client) {
+	delivered := 0
 	var slow []*Client
 	for c := range b.clients {
 		if c == exclude {
@@ -163,12 +166,15 @@ func (b *Board) deliverReliable(data []byte, exclude *Client) {
 		}
 		select {
 		case c.send <- data:
+			delivered++
 		default:
 			slow = append(slow, c)
 		}
 	}
+	b.metrics.MessagesDelivered(delivered)
 	for _, c := range slow {
 		b.log.Warn("kicking slow client: send buffer full", "client", c.id)
+		b.metrics.ClientKicked()
 		b.detach(c, true)
 	}
 }
@@ -177,15 +183,18 @@ func (b *Board) deliverReliable(data []byte, exclude *Client) {
 // message for any client whose buffer is full. Used for cursor updates: a stale
 // cursor position is worthless, so it is never worth buffering or kicking over.
 func (b *Board) deliverBestEffort(data []byte, exclude *Client) {
+	delivered := 0
 	for c := range b.clients {
 		if c == exclude {
 			continue
 		}
 		select {
 		case c.send <- data:
+			delivered++
 		default:
 		}
 	}
+	b.metrics.MessagesDelivered(delivered)
 }
 
 // push delivers one reliable message to a single client, kicking it if its
@@ -193,9 +202,11 @@ func (b *Board) deliverBestEffort(data []byte, exclude *Client) {
 func (b *Board) push(c *Client, data []byte) bool {
 	select {
 	case c.send <- data:
+		b.metrics.MessagesDelivered(1)
 		return true
 	default:
 		b.log.Warn("kicking slow client during onboarding", "client", c.id)
+		b.metrics.ClientKicked()
 		b.detach(c, true)
 		return false
 	}

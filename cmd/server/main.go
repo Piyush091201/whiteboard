@@ -22,6 +22,7 @@ import (
 
 	"github.com/Piyush091201/whiteboard/internal/broker"
 	"github.com/Piyush091201/whiteboard/internal/hub"
+	"github.com/Piyush091201/whiteboard/internal/metrics"
 	"github.com/Piyush091201/whiteboard/internal/store"
 	"github.com/Piyush091201/whiteboard/internal/ws"
 )
@@ -140,7 +141,9 @@ func run(logger *slog.Logger) error {
 		defer func() { _ = st.Close() }()
 	}
 
-	h := hub.New(logger, b, st)
+	m := metrics.NewPrometheus()
+
+	h := hub.New(logger, b, hub.WithStore(st), hub.WithMetrics(m))
 	defer h.Close()
 
 	mux := http.NewServeMux()
@@ -150,7 +153,8 @@ func run(logger *slog.Logger) error {
 	})
 	// WebSocket endpoint: clients connect to /ws/<board-id> to join a board.
 	mux.Handle("GET /ws/{board}", ws.Handler(h))
-	// Later phases register GET /metrics here.
+	// Prometheus metrics: active connections, throughput, backpressure.
+	mux.Handle("GET /metrics", m.Handler())
 
 	srv := &http.Server{
 		Addr:              cfg.addr,
