@@ -120,6 +120,9 @@ func (h *Hub) Serve(ctx context.Context, boardID string, info ClientInfo, conn C
 	c.board = h.acquire(boardID)
 	defer h.release(c)
 
+	h.metrics.ConnOpened()
+	defer h.metrics.ConnClosed()
+
 	c.board.register <- c
 
 	// Join the global roster and announce arrival, then deliver this client its
@@ -173,6 +176,7 @@ func (c *Client) readPump(ctx context.Context) {
 			c.log.Warn("dropping unparseable message", "err", err)
 			continue
 		}
+		c.board.metrics.MessageReceived()
 		switch env.Type {
 		case protocol.TypeShapeCreate, protocol.TypeShapeUpdate, protocol.TypeShapeDelete:
 			// Shape ops are sequenced and stored via the broker; the loop-back

@@ -37,7 +37,9 @@ type boardEntry struct {
 type Hub struct {
 	log     *slog.Logger
 	broker  broker.Broker
-	persist *persistence // nil when persistence is disabled
+	store   store.Store // set via WithStore; nil disables persistence
+	persist *persistence
+	metrics Metrics
 
 	mu     sync.Mutex
 	boards map[string]*boardEntry
@@ -46,17 +48,43 @@ type Hub struct {
 	wg   sync.WaitGroup // tracks the coordinator goroutine
 }
 
-// New constructs a Hub backed by the given broker (shared state and message bus)
-// and an optional durable store. A nil store disables persistence; a nil logger
-// falls back to slog.Default(). When a store is provided, a coordinator
-// goroutine periodically snapshots active boards; call Close to stop it.
-func New(log *slog.Logger, b broker.Broker, s store.Store) *Hub {
+// Option configures a Hub. Options keep the constructor small as optional
+// dependencies (persistence, metrics) are added.
+type Option func(*Hub)
+
+// WithStore enables durable persistence backed by s. A nil store is a no-op.
+func WithStore(s store.Store) Option {
+	return func(h *Hub) { h.store = s }
+}
+
+// WithMetrics records hub activity through m. A nil Metrics is a no-op.
+func WithMetrics(m Metrics) Option {
+	return func(h *Hub) {
+		if m != nil {
+			h.metrics = m
+		}
+	}
+}
+
+// New constructs a Hub backed by the given broker (shared state and message
+// bus). A nil logger falls back to slog.Default(). When WithStore supplies a
+// store, a coordinator goroutine periodically snapshots active boards; call
+// Close to stop it.
+func New(log *slog.Logger, b broker.Broker, opts ...Option) *Hub {
 	if log == nil {
 		log = slog.Default()
 	}
-	h := &Hub{log: log, broker: b, boards: make(map[string]*boardEntry)}
-	if s != nil {
-		h.persist = &persistence{broker: b, store: s, log: log}
+	h := &Hub{
+		log:     log,
+		broker:  b,
+		metrics: nopMetrics{},
+		boards:  make(map[string]*boardEntry),
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	if h.store != nil {
+		h.persist = &persistence{broker: b, store: h.store, log: log}
 		h.stop = make(chan struct{})
 		h.wg.Add(1)
 		go h.snapshotLoop(snapshotInterval)
@@ -112,9 +140,10 @@ func (h *Hub) acquire(id string) *Board {
 
 	e, ok := h.boards[id]
 	if !ok {
-		e = &boardEntry{board: newBoard(id, h.log, h.broker, h.persist)}
+		e = &boardEntry{board: newBoard(id, h.log, h.broker, h.persist, h.metrics)}
 		h.boards[id] = e
 		go e.board.run()
+		h.metrics.BoardOpened()
 	}
 	e.count++
 	return e.board
@@ -146,6 +175,7 @@ func (h *Hub) release(c *Client) {
 
 	if last {
 		close(b.quit) // board shuts down and drains all remaining clients
+		h.metrics.BoardClosed()
 		return
 	}
 	select {
