@@ -44,6 +44,13 @@ type Broker interface {
 	// Snapshot returns the board's current shapes, ordered by sequence.
 	Snapshot(ctx context.Context, boardID string) (protocol.Snapshot, error)
 
+	// Hydrate loads a snapshot into an empty board (cold start), setting each
+	// shape's stored sequence and the board's sequence counter. It is
+	// idempotent: if the board already has state it does nothing and reports
+	// false, so instances cold-starting the same board cannot clobber each
+	// other.
+	Hydrate(ctx context.Context, boardID string, snap protocol.Snapshot) (bool, error)
+
 	// SetPresence adds or updates a participant in the board's global roster.
 	// presence is the encoded protocol.Presence.
 	SetPresence(ctx context.Context, boardID, clientID string, presence []byte) error
