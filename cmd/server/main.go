@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,6 +18,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
+	"github.com/Piyush091201/whiteboard/internal/broker"
 	"github.com/Piyush091201/whiteboard/internal/hub"
 	"github.com/Piyush091201/whiteboard/internal/ws"
 )
@@ -29,12 +33,14 @@ import (
 // idiomatic baseline; we only reach for a library if this grows unwieldy.
 type config struct {
 	addr            string        // host:port the HTTP server listens on
+	redisAddr       string        // Redis host:port; empty => in-memory single-instance broker
 	shutdownTimeout time.Duration // how long to wait for in-flight requests to drain
 }
 
 func loadConfig() config {
 	return config{
 		addr:            getenv("WB_ADDR", ":8080"),
+		redisAddr:       getenv("WB_REDIS_ADDR", ""),
 		shutdownTimeout: 15 * time.Second,
 	}
 }
@@ -44,6 +50,26 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// newBroker builds the message/state broker from configuration. With a Redis
+// address it verifies connectivity up front so a misconfiguration fails fast at
+// startup rather than on the first message.
+func newBroker(ctx context.Context, logger *slog.Logger, cfg config) (broker.Broker, error) {
+	if cfg.redisAddr == "" {
+		logger.Info("using in-memory broker (single instance)")
+		return broker.NewMemory(), nil
+	}
+
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.redisAddr})
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		_ = rdb.Close()
+		return nil, fmt.Errorf("connect to redis at %s: %w", cfg.redisAddr, err)
+	}
+	logger.Info("using redis broker", "addr", cfg.redisAddr)
+	return broker.NewRedis(rdb), nil
 }
 
 func main() {
@@ -79,7 +105,16 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	h := hub.New(logger)
+	// Choose the broker: Redis for multi-instance fan-out, or an in-process
+	// broker for single-instance operation. Both satisfy the same interface, so
+	// the hub is unaware of which one it is using.
+	b, err := newBroker(ctx, logger, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = b.Close() }()
+
+	h := hub.New(logger, b)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {

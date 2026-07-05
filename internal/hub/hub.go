@@ -16,6 +16,8 @@ package hub
 import (
 	"log/slog"
 	"sync"
+
+	"github.com/Piyush091201/whiteboard/internal/broker"
 )
 
 // boardEntry tracks a live board plus the number of clients keeping it open.
@@ -30,18 +32,20 @@ type boardEntry struct {
 
 // Hub is the registry of active boards. It is safe for concurrent use.
 type Hub struct {
-	log *slog.Logger
+	log    *slog.Logger
+	broker broker.Broker
 
 	mu     sync.Mutex
 	boards map[string]*boardEntry
 }
 
-// New constructs a Hub. A nil logger falls back to slog.Default().
-func New(log *slog.Logger) *Hub {
+// New constructs a Hub backed by the given broker (which holds shared board
+// state and the message bus). A nil logger falls back to slog.Default().
+func New(log *slog.Logger, b broker.Broker) *Hub {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Hub{log: log, boards: make(map[string]*boardEntry)}
+	return &Hub{log: log, broker: b, boards: make(map[string]*boardEntry)}
 }
 
 // acquire returns the board for id, creating and starting it if necessary, and
@@ -53,7 +57,7 @@ func (h *Hub) acquire(id string) *Board {
 
 	e, ok := h.boards[id]
 	if !ok {
-		e = &boardEntry{board: newBoard(id, h.log)}
+		e = &boardEntry{board: newBoard(id, h.log, h.broker)}
 		h.boards[id] = e
 		go e.board.run()
 	}

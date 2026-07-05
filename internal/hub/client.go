@@ -121,6 +121,21 @@ func (h *Hub) Serve(ctx context.Context, boardID string, info ClientInfo, conn C
 
 	c.board.register <- c
 
+	// Fetch the current board snapshot from the broker off the board goroutine
+	// (it is network I/O), then hand it to the board to deliver — keeping the
+	// board the sole writer of c.send. The client is already registered, so any
+	// op published after this point is delivered live; the client reconciles
+	// snapshot and live ops by sequence number.
+	if snap, err := c.board.broker.Snapshot(ctx, boardID); err != nil {
+		c.log.Warn("snapshot fetch failed", "err", err)
+	} else if data, err := protocol.Marshal(protocol.TypeSnapshot, 0, snap); err == nil {
+		select {
+		case c.board.snapshots <- snapshotReq{c: c, data: data}:
+		case <-c.board.done:
+		case <-ctx.Done():
+		}
+	}
+
 	// A connection-scoped context so that when one pump stops, the other
 	// unwinds promptly.
 	ctx, cancel := context.WithCancel(ctx)
@@ -160,13 +175,45 @@ func (c *Client) readPump(ctx context.Context) {
 			c.log.Warn("dropping unparseable message", "err", err)
 			continue
 		}
-		select {
-		case c.board.inbound <- inbound{origin: c, env: env}:
-		case <-c.board.done: // board is shutting down
-			return
-		case <-ctx.Done():
-			return
+		switch env.Type {
+		case protocol.TypeShapeCreate, protocol.TypeShapeUpdate, protocol.TypeShapeDelete:
+			// Shape ops are sequenced and stored via the broker off the board
+			// goroutine; the loop-back subscription delivers them to clients.
+			c.applyShapeOp(ctx, env)
+		default:
+			// Locally-handled messages (cursors) go to the board.
+			select {
+			case c.board.inbound <- inbound{origin: c, env: env}:
+			case <-c.board.done: // board is shutting down
+				return
+			case <-ctx.Done():
+				return
+			}
 		}
+	}
+}
+
+// applyShapeOp sequences and stores a shape op via the broker, then publishes
+// the sequenced message. Delivery to clients (including this one) happens on the
+// board's subscription loop-back, so this method never touches client state.
+func (c *Client) applyShapeOp(ctx context.Context, env protocol.Envelope) {
+	var op protocol.ShapeOp
+	if err := env.DecodePayload(&op); err != nil || op.ID == "" {
+		c.log.Warn("dropping invalid shape op", "type", env.Type, "err", err)
+		return
+	}
+	del := env.Type == protocol.TypeShapeDelete
+	seq, err := c.board.broker.ApplyShape(ctx, c.boardID, op.ID, op.Shape, del)
+	if err != nil {
+		c.log.Error("broker apply failed", "err", err)
+		return
+	}
+	msg, err := protocol.Marshal(env.Type, seq, op)
+	if err != nil {
+		return
+	}
+	if err := c.board.broker.Publish(ctx, c.boardID, msg); err != nil {
+		c.log.Error("broker publish failed", "err", err)
 	}
 }
 
