@@ -185,13 +185,22 @@ func run(logger *slog.Logger) error {
 		logger.Info("shutdown signal received, draining", "timeout", cfg.shutdownTimeout)
 	}
 
-	// Give in-flight work a bounded window to finish. In later phases this is
-	// where we also signal the hub to close connections gracefully.
+	// Give in-flight work a bounded window to finish.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
 	defer cancel()
 
+	// Stop accepting new connections first. Shutdown does not close hijacked
+	// WebSocket connections, so it returns quickly while sessions are still live.
 	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http server shutdown error", "err", err)
+	}
+
+	// Drain the live WebSocket sessions: close every board, flush a final
+	// snapshot, and wait for connections to finish within the timeout.
+	if err := h.Shutdown(shutdownCtx); err != nil {
+		logger.Error("hub drain did not finish in time", "err", err)
 		return err
 	}
+	logger.Info("drain complete")
 	return nil
 }

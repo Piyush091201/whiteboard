@@ -41,11 +41,14 @@ type Hub struct {
 	persist *persistence
 	metrics Metrics
 
-	mu     sync.Mutex
-	boards map[string]*boardEntry
+	mu       sync.Mutex
+	boards   map[string]*boardEntry
+	closing  bool           // set by Shutdown; blocks new sessions
+	sessions sync.WaitGroup // tracks in-flight Serve calls
 
-	stop chan struct{}  // closed by Close to stop the coordinator
-	wg   sync.WaitGroup // tracks the coordinator goroutine
+	stop     chan struct{}  // closed to stop the coordinator
+	stopOnce sync.Once      // guards close(stop)
+	wg       sync.WaitGroup // tracks the coordinator goroutine
 }
 
 // Option configures a Hub. Options keep the constructor small as optional
@@ -93,12 +96,69 @@ func New(log *slog.Logger, b broker.Broker, opts ...Option) *Hub {
 }
 
 // Close stops the persistence coordinator. It is safe to call when persistence
-// is disabled (a no-op).
+// is disabled and safe to call more than once (Shutdown also calls it).
 func (h *Hub) Close() {
+	h.stopCoordinator()
+}
+
+func (h *Hub) stopCoordinator() {
 	if h.stop != nil {
-		close(h.stop)
+		h.stopOnce.Do(func() { close(h.stop) })
 		h.wg.Wait()
 	}
+}
+
+// Shutdown gracefully drains the hub: it stops accepting new sessions, closes
+// every board (which drains its clients, closes their connections, and writes a
+// final durable snapshot), and waits for all in-flight connections to finish or
+// ctx to expire. It also stops the persistence coordinator. After Shutdown the
+// hub rejects new Serve calls.
+func (h *Hub) Shutdown(ctx context.Context) error {
+	h.mu.Lock()
+	if h.closing {
+		h.mu.Unlock()
+		return nil
+	}
+	h.closing = true
+	boards := make([]*Board, 0, len(h.boards))
+	for _, e := range h.boards {
+		boards = append(boards, e.board)
+	}
+	// Clear the registry so a draining client's release becomes a no-op and can
+	// never double-close a board.
+	h.boards = make(map[string]*boardEntry)
+	h.mu.Unlock()
+
+	h.log.Info("draining hub", "boards", len(boards))
+	for _, b := range boards {
+		b.closeQuit()
+	}
+
+	// Wait for each board to finish draining and persisting.
+	for _, b := range boards {
+		select {
+		case <-b.done:
+		case <-ctx.Done():
+			h.stopCoordinator()
+			return ctx.Err()
+		}
+	}
+
+	// Wait for every Serve call to complete its own cleanup.
+	sessionsDone := make(chan struct{})
+	go func() {
+		h.sessions.Wait()
+		close(sessionsDone)
+	}()
+	select {
+	case <-sessionsDone:
+	case <-ctx.Done():
+		h.stopCoordinator()
+		return ctx.Err()
+	}
+
+	h.stopCoordinator()
+	return nil
 }
 
 // snapshotLoop periodically persists every active board until Close is called.
@@ -131,12 +191,20 @@ func (h *Hub) snapshotAllBoards() {
 	}
 }
 
-// acquire returns the board for id, creating and starting it if necessary, and
-// increments its keep-open count. Every acquire must be paired with exactly one
-// release.
-func (h *Hub) acquire(id string) *Board {
+// beginSession registers a new connection: under one lock it rejects the
+// session if the hub is shutting down, tracks it for graceful drain, and returns
+// the board for id (creating and starting it if necessary) with its keep-open
+// count incremented. A true result must be paired with exactly one release and
+// one sessions.Done. Doing this atomically means a shutdown can never race with
+// a new board being created.
+func (h *Hub) beginSession(id string) (*Board, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if h.closing {
+		return nil, false
+	}
+	h.sessions.Add(1)
 
 	e, ok := h.boards[id]
 	if !ok {
@@ -146,7 +214,7 @@ func (h *Hub) acquire(id string) *Board {
 		h.metrics.BoardOpened()
 	}
 	e.count++
-	return e.board
+	return e.board, true
 }
 
 // release decrements the keep-open count for the client's board. When the last
@@ -174,8 +242,7 @@ func (h *Hub) release(c *Client) {
 	h.mu.Unlock()
 
 	if last {
-		close(b.quit) // board shuts down and drains all remaining clients
-		h.metrics.BoardClosed()
+		b.closeQuit() // board shuts down and drains all remaining clients
 		return
 	}
 	select {
