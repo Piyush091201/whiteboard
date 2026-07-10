@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 
 	"github.com/Piyush091201/whiteboard/internal/broker"
 	"github.com/Piyush091201/whiteboard/internal/protocol"
@@ -36,10 +37,17 @@ type Board struct {
 	direct     chan clientMsg // deliver a message to one specific client
 	inspect    chan chan int  // request the current client count
 	quit       chan struct{}  // closed by the hub when the board should stop
+	quitOnce   sync.Once      // guards close(quit); last-release and shutdown may both request it
 	done       chan struct{}  // closed when run() has returned
 
 	clients map[*Client]struct{}
 	byID    map[string]*Client // id -> client, for excluding a cursor's origin
+}
+
+// closeQuit signals the board to stop. Idempotent, because both the last client
+// leaving and a hub-wide shutdown can request it.
+func (b *Board) closeQuit() {
+	b.quitOnce.Do(func() { close(b.quit) })
 }
 
 func newBoard(id string, log *slog.Logger, b broker.Broker, p *persistence, m Metrics) *Board {
@@ -66,6 +74,8 @@ func newBoard(id string, log *slog.Logger, b broker.Broker, p *persistence, m Me
 // loop-back) reaches everyone the same way. It exits when the hub closes b.quit.
 func (b *Board) run() {
 	defer close(b.done)
+	defer b.metrics.BoardClosed() // fires once, whether the trigger is the last
+	//                               client leaving or a hub-wide shutdown.
 
 	// Cold-start hydration happens before the select loop, so the first client's
 	// register (which blocks until we reach the loop) is served only after the

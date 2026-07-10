@@ -104,6 +104,16 @@ func defaultColor(color, id string) string {
 // a WaitGroup. The defers run in LIFO order on every exit path (including
 // panics), which is how cleanup is guaranteed without try/finally.
 func (h *Hub) Serve(ctx context.Context, boardID string, info ClientInfo, conn Conn) {
+	// beginSession atomically rejects the connection if the hub is shutting down
+	// and otherwise registers the board (keeping it alive for the register send
+	// that follows) and tracks this session for graceful drain.
+	board, ok := h.beginSession(boardID)
+	if !ok {
+		_ = conn.Close()
+		return
+	}
+	defer h.sessions.Done()
+
 	id := newID()
 	c := &Client{
 		id:      id,
@@ -112,12 +122,9 @@ func (h *Hub) Serve(ctx context.Context, boardID string, info ClientInfo, conn C
 		color:   defaultColor(info.Color, id),
 		conn:    conn,
 		send:    make(chan []byte, sendBuffer),
+		board:   board,
 	}
 	c.log = h.log.With("client", c.id, "board", boardID)
-
-	// acquire bumps the board's keep-open count under the hub lock, so the
-	// board is guaranteed alive for the register send that follows.
-	c.board = h.acquire(boardID)
 	defer h.release(c)
 
 	h.metrics.ConnOpened()
