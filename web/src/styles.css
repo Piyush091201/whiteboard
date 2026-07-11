@@ -1,0 +1,85 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  color: #0f172a;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc;
+  flex: 0 0 auto;
+}
+
+.brand {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.board {
+  color: #64748b;
+  font-weight: 500;
+}
+
+.roster {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 1 1 auto;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  font-size: 13px;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.hint {
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+.board-canvas {
+  flex: 1 1 auto;
+  width: 100%;
+  display: block;
+  background:
+    linear-gradient(#eef2f7 1px, transparent 1px) 0 0 / 24px 24px,
+    linear-gradient(90deg, #eef2f7 1px, transparent 1px) 0 0 / 24px 24px,
+    #ffffff;
+  cursor: crosshair;
+  touch-action: none;
+}

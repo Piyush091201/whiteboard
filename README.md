@@ -10,10 +10,29 @@ Redis fan-out, last-write-wins conflict resolution, backpressure, graceful
 shutdown, persistence, and observability — all proven correct under the race
 detector in CI.
 
-> **Status:** backend complete (phases 0–8). One instance sustains **10,000
-> concurrent WebSocket connections** and fans out **250,000 messages/second** on a
-> single dev laptop — see [Load test](#load-test). Frontend polish is the
-> remaining phase.
+> **Status:** complete. One instance sustains **10,000 concurrent WebSocket
+> connections** and fans out **250,000 messages/second** on a single dev laptop
+> (see [Load test](#load-test)), with a lean React client for the UI.
+
+---
+
+## Demo
+
+Two browser windows on the same board, drawing simultaneously — shapes sync both
+ways (last-write-wins by server sequence), each user sees the other's live cursor,
+and the roster tracks who's present:
+
+<!-- Record a short GIF from two windows and drop it here:
+     ![two users collaborating](docs/demo.gif) -->
+
+```sh
+go run ./cmd/server                 # backend (in-memory broker is fine locally)
+cd web && npm install && npm run dev # frontend dev server on :5173
+# open http://localhost:5173/#demo in two windows
+```
+
+See [web/README.md](web/README.md) for details. The client is intentionally
+lean — the engineering focus is the backend.
 
 ---
 
@@ -114,7 +133,7 @@ deploy/             # docker-compose for local dev (app + Postgres + Redis)
 | 6 | Observability: structured logging, `/metrics` | ✅ |
 | 7 | Graceful shutdown end-to-end (SIGTERM drain) | ✅ |
 | 8 | Load test: N concurrent clients; documented numbers | ✅ |
-| 9 | Frontend polish | ⬜ |
+| 9 | Frontend: React + TS + Canvas client (draw, cursors, presence) | ✅ |
 
 ## Development
 
